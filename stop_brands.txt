@@ -12,6 +12,7 @@ ONEBOT
 2buy.kz
 3LAB
 5STAR
+ZOWIE
 70mai
 Samsung
 Mi
