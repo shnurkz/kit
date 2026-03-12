@@ -2,12 +2,13 @@ import streamlit as st
 import pandas as pd
 import requests
 import xml.etree.ElementTree as ET
-from playwright.sync_api import sync_playwright
+from playwright.async_api import async_playwright
 import time
 import traceback
 import sys
 import asyncio
 import sqlite3
+import io
 
 def init_db():
     with sqlite3.connect("mapping.db") as conn:
@@ -62,15 +63,19 @@ def sync_supplier_to_db(xml_df):
 
 def load_data_from_db():
     with sqlite3.connect("mapping.db") as conn:
-        db_df = pd.read_sql_query("SELECT * FROM products", conn)
+        db_df = pd.read_sql_query('''
+            SELECT supplier_sku, name as supplier_name, brand, supplier_price, stock, weight, kaspi_sku, name as kaspi_name, kaspi_price, min_price, final_price 
+            FROM products
+        ''', conn)
         
     db_df = db_df.rename(columns={
         'supplier_sku': 'Артикул поставщика',
-        'name': 'Наименование',
+        'supplier_name': 'Наименование',
         'brand': 'Бренд',
         'supplier_price': 'Цена закупа',
         'stock': 'Остаток',
         'kaspi_sku': 'Артикул Каспи',
+        'kaspi_name': 'Название Каспи',
         'kaspi_price': 'Цена на Каспи',
         'weight': 'Вес (кг)',
         'min_price': 'Минимальная цена',
@@ -78,6 +83,24 @@ def load_data_from_db():
     })
     return db_df
 
+def save_table_edits():
+    if "product_editor" in st.session_state:
+        edited_rows = st.session_state["product_editor"].get("edited_rows", {})
+        for row_idx, changes in edited_rows.items():
+            if 'current_page_df' in st.session_state and row_idx < len(st.session_state.current_page_df):
+                actual_index = st.session_state.current_page_df.index[row_idx]
+                supplier_sku = st.session_state.df.at[actual_index, 'Артикул поставщика']
+                
+                if 'Артикул Каспи' in changes:
+                    new_sku = str(changes['Артикул Каспи']).strip()
+                    if new_sku == 'nan': new_sku = ''
+                    
+                    with sqlite3.connect('mapping.db') as conn:
+                        cursor = conn.cursor()
+                        cursor.execute("UPDATE products SET kaspi_sku = ? WHERE supplier_sku = ?", (new_sku, supplier_sku))
+                        conn.commit()
+                    
+                    st.session_state.df.at[actual_index, 'Артикул Каспи'] = new_sku
 
 # Настройка страницы
 st.set_page_config(page_title="Kaspi Manager", layout="wide")
@@ -151,6 +174,7 @@ def load_and_parse_xml():
                     'Остаток': stock_int,
                     'Вес (кг)': weight,
                     'Артикул Каспи': '',           # Пустое поле для твоего ввода
+                    'Название Каспи': '',
                     'Цена на Каспи': 0.0,          # Будет заполняться парсером
                     'Минимальная цена': 0.0,       
                     'Цена реализации': 0.0         
@@ -201,88 +225,149 @@ def calculate_target_prices(purchase_price: float, weight: float, kaspi_competit
         
     return min_price, final_price
 
-def fetch_batch_kaspi_prices(sku_list: list, progress_bar, status_text) -> dict:
+async def fetch_batch_kaspi_prices_async(sku_list: list, progress_bar, status_text) -> dict:
     prices_dict = {}
-    try:
-        if sys.platform == "win32":
-            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-            
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context()
-            page = context.new_page()
-            
-            try:
-                for i, sku in enumerate(sku_list):
-                    status_text.text(f"Парсинг артикула {sku} ({i+1}/{len(sku_list)})...")
-                    progress_bar.progress((i + 1) / len(sku_list))
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+        
+    sem = asyncio.Semaphore(5)
+    
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context()
+        
+        async def process_sku(sku, idx, total):
+            async with sem:
+                page = await context.new_page()
+                # Только блокируем шрифты и картинки, пускаем CSS и JS
+                await page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "font"] else route.continue_())
+                
+                status_text.text(f"Парсинг артикула {sku} ({idx+1}/{total})...")
+                progress_bar.progress((idx + 1) / total)
+                
+                prices_found = []
+                kaspi_name = ""
+                try:
+                    await page.goto(f"https://kaspi.kz/shop/search/?text={sku}", wait_until="domcontentloaded")
                     
-                    prices_found = []
                     try:
-                        page.goto(f"https://kaspi.kz/shop/search/?text={sku}")
-                        
-                        page.wait_for_selector('a[href*="/p/"]', timeout=15000)
-                        product_href = page.locator('a[href*="/p/"]').first.get_attribute("href")
+                        product_link = page.locator('a[href*="/p/"]').first
+                        await product_link.wait_for(state="attached", timeout=15000)
+                        product_href = await product_link.get_attribute("href")
                         
                         if product_href:
                             product_url = f"https://kaspi.kz{product_href}" if product_href.startswith("/") else product_href
-                            page.goto(product_url)
-                            page.wait_for_timeout(1500)
+                            await page.goto(product_url, wait_until="domcontentloaded")
+                            await page.wait_for_timeout(2000)
                             
-                            tab_locator = page.locator('text="Продавцы"').first
-                            tab_locator.wait_for(timeout=15000)
-                            tab_locator.evaluate("element => element.click()")
-                            page.wait_for_timeout(2000)
+                            kaspi_name = ""
+                            try:
+                                # Try the user's specific XPath first
+                                name_locator = page.locator('xpath=/html/body/div[1]/div[3]/div/div[2]/div/div[2]/div/div[1]/h1').first
+                                await name_locator.wait_for(state="attached", timeout=3000)
+                                kaspi_name = await name_locator.inner_text()
+                            except Exception:
+                                try:
+                                    # Fallback to generic h1 with product class
+                                    name_locator = page.locator('h1.item__heading').first
+                                    await name_locator.wait_for(state="attached", timeout=2000)
+                                    kaspi_name = await name_locator.inner_text()
+                                except Exception as e:
+                                    print(f"Name extraction failed for {sku}: {traceback.format_exc()}")
+                                    kaspi_name = ""
+                            kaspi_name = kaspi_name.strip()
+                            
+                            tab_locator = page.locator('li[data-tab="offers"], a:has-text("Продавцы"), li:has-text("Продавцы")').first
+                            await tab_locator.evaluate("node => node.click()")
+                            await page.wait_for_timeout(2000)
                         
-                        page.wait_for_selector("table tbody tr", timeout=15000)
-                        rows = page.locator("table tbody tr").all()
+                        await page.wait_for_selector("table tbody tr", timeout=15000)
+                        rows = await page.locator("table tbody tr").all()
                         
                         for row in rows:
-                            cells = row.locator("td").all()
-                            if len(cells) < 4:
+                            cells_count = await row.locator("td").count()
+                            if cells_count < 4:
                                 continue
                                 
-                            seller_name = cells[0].inner_text()
+                            seller_name = await row.locator("td").nth(0).inner_text()
                             if "ИП EVENTRENT" in seller_name:
                                 continue
                                 
-                            price_text = cells[3].inner_text()
+                            price_text = await row.locator("td").nth(3).inner_text()
                             price_part = price_text.split('₸')[0]
                             just_digits = ''.join(c for c in price_part if c.isdigit())
                             
                             if just_digits:
                                 prices_found.append(float(just_digits))
                                 
-                        if prices_found:
-                            min_price = min(prices_found)
-                            prices_dict[sku] = min_price
-                        else:
-                            prices_dict[sku] = 0.0
-                            
-                        with sqlite3.connect("mapping.db") as conn:
-                            cursor = conn.cursor()
-                            cursor.execute("SELECT supplier_price, weight FROM products WHERE kaspi_sku = ?", (sku,))
-                            row_db = cursor.fetchone()
-                            if row_db:
-                                purchase_price, weight = row_db
-                                min_price, final_price = calculate_target_prices(purchase_price, weight, prices_dict[sku])
-                                cursor.execute("UPDATE products SET kaspi_price = ?, min_price = ?, final_price = ? WHERE kaspi_sku = ?", (prices_dict[sku], min_price, final_price, sku))
-                            else:
-                                cursor.execute("UPDATE products SET kaspi_price = ? WHERE kaspi_sku = ?", (prices_dict[sku], sku))
-                            conn.commit()
-                            
                     except Exception as e:
-                        print(f"Error fetching Kaspi price for {sku}: {traceback.format_exc()}")
-                        prices_dict[sku] = 0.0
-                        
-                    time.sleep(3)
-            finally:
-                browser.close()
-            
-    except Exception as e:
-        st.error(f"Scraper Error:\\n{traceback.format_exc()}")
+                        print(f"Navigation/Element error for {sku}: {traceback.format_exc()}")
+
+                    if prices_found:
+                        min_price = min(prices_found)
+                    else:
+                        min_price = 0.0
+
+                    return sku, min_price, kaspi_name
+
+                except Exception as e:
+                    print(f"Error fetching Kaspi price for {sku}: {traceback.format_exc()}")
+                    return sku, 0.0, ""
+                finally:
+                    await page.close()
+                    await asyncio.sleep(2)
+                    
+        tasks = [process_sku(sku, i, len(sku_list)) for i, sku in enumerate(sku_list)]
+        results = await asyncio.gather(*tasks)
         
+        for res in results:
+            if not res:
+                continue
+            sku, min_price, kaspi_name = res
+            
+            prices_dict[sku] = {
+                'min_price': min_price,
+                'kaspi_name': kaspi_name
+            }
+            
+            with sqlite3.connect("mapping.db") as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT supplier_price, weight FROM products WHERE kaspi_sku =?", (sku,))
+                row_db = cursor.fetchone()
+                
+                if row_db:
+                    purchase_price, weight = row_db
+                    calc_min_price, final_price = calculate_target_prices(purchase_price, weight, min_price)
+                    cursor.execute("UPDATE products SET kaspi_price = ?, min_price = ?, final_price = ?, name = CASE WHEN ? != '' THEN ? ELSE name END WHERE kaspi_sku = ?", 
+                                   (min_price, calc_min_price, final_price, kaspi_name, kaspi_name, sku))
+                else:
+                    cursor.execute("UPDATE products SET kaspi_price = ?, name = CASE WHEN ? != '' THEN ? ELSE name END WHERE kaspi_sku = ?", 
+                                   (min_price, kaspi_name, kaspi_name, sku))
+                conn.commit()
+                
+        await browser.close()
+            
     return prices_dict
+
+def generate_kaspi_excel(df: pd.DataFrame) -> bytes:
+    filtered_df = df[df['Артикул Каспи'].astype(str).str.strip() != '']
+    filtered_df = filtered_df[filtered_df['Артикул Каспи'].astype(str).str.strip() != 'nan']
+    
+    kaspi_df = pd.DataFrame()
+    kaspi_df['SKU'] = filtered_df['Артикул Каспи']
+    kaspi_df['model'] = filtered_df['Наименование']
+    kaspi_df['brand'] = filtered_df['Бренд']
+    kaspi_df['price'] = filtered_df['Цена реализации'].fillna(0).astype(int)
+    kaspi_df['PP1'] = filtered_df['Остаток'].fillna(0).astype(int)
+    kaspi_df['PP2'] = 'no'
+    kaspi_df['PP3'] = 'no'
+    kaspi_df['PP4'] = 'no'
+    kaspi_df['PP5'] = 'no'
+    kaspi_df['preorder'] = 0
+    
+    output = io.BytesIO()
+    kaspi_df.to_excel(output, index=False, engine='openpyxl')
+    return output.getvalue()
 
 # Загружаем данные
 st.write("Скачивание и обработка прайса Al-Style...")
@@ -349,31 +434,53 @@ if not df.empty:
                 else:
                     st.error("Артикул и Наименование обязательны для заполнения!")
 
+    # Кнопка скачивания Excel для Kaspi
+    excel_data = generate_kaspi_excel(df)
+    st.download_button(
+        label="📥 Скачать Excel для Kaspi",
+        data=excel_data,
+        file_name="kaspi_upload.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary"
+    )
+
+    st.markdown("---")
+    
+    # Поиск и фильтрация
+    search_query = st.text_input("🔍 Поиск по артикулу, названию или бренду", "")
+    
+    if search_query:
+        search_lower = search_query.lower()
+        mask = (
+            df['Артикул поставщика'].astype(str).str.lower().str.contains(search_lower) |
+            df['Наименование'].astype(str).str.lower().str.contains(search_lower) |
+            df['Бренд'].astype(str).str.lower().str.contains(search_lower) |
+            df['Артикул Каспи'].astype(str).str.lower().str.contains(search_lower)
+        )
+        display_df = df[mask].copy()
+    else:
+        display_df = df.copy()
+
+    # Пагинация
+    page_size = 50
+    total_pages = max(1, len(display_df) // page_size + (1 if len(display_df) % page_size > 0 else 0))
+    page_number = st.number_input("Страница", min_value=1, max_value=total_pages, value=1)
+    
+    start_idx = (page_number - 1) * page_size
+    end_idx = start_idx + page_size
+    st.session_state.current_page_df = display_df.iloc[start_idx:end_idx]
+
     # Выводим интерактивную таблицу
-    edited_df = st.data_editor(
-        df, 
+    st.data_editor(
+        st.session_state.current_page_df, 
+        column_order=["Артикул поставщика", "Наименование", "Бренд", "Цена закупа", "Остаток", "Вес (кг)", "Артикул Каспи", "Название Каспи", "Цена на Каспи", "Минимальная цена", "Цена реализации"],
         use_container_width=True,
         hide_index=True,
-        disabled=["Артикул поставщика", "Наименование", "Бренд", "Цена закупа", "Остаток", "Вес (кг)", "Минимальная цена", "Цена реализации"],
-        key="data_editor"
+        disabled=["Артикул поставщика", "Наименование", "Бренд", "Цена закупа", "Остаток", "Вес (кг)", "Название Каспи", "Цена на Каспи", "Минимальная цена", "Цена реализации"],
+        key="product_editor",
+        on_change=save_table_edits
     )
-    
-    # Мгновенное сохранение ручных изменений артикулов в базу данных
-    for index, row in edited_df.iterrows():
-        old_kaspi_sku = str(df.at[index, 'Артикул Каспи']).strip()
-        new_kaspi_sku = str(row['Артикул Каспи']).strip()
-        
-        if old_kaspi_sku == 'nan': old_kaspi_sku = ''
-        if new_kaspi_sku == 'nan': new_kaspi_sku = ''
-        
-        if old_kaspi_sku != new_kaspi_sku:
-            supplier_sku = row['Артикул поставщика']
-            with sqlite3.connect("mapping.db") as conn:
-                cursor = conn.cursor()
-                cursor.execute("UPDATE products SET kaspi_sku = ? WHERE supplier_sku = ?", (new_kaspi_sku, supplier_sku))
-                conn.commit()
-            st.session_state.df.at[index, 'Артикул Каспи'] = new_kaspi_sku
-
+            
     # Кнопка для запуска парсера
     if st.button("Запросить цены Каспи"):
         st.write("Запускаем сбор цен...")
@@ -389,8 +496,12 @@ if not df.empty:
             progress_bar = st.progress(0)
             status_text = st.empty()
             
-            # Запускаем парсер
-            prices_dict = fetch_batch_kaspi_prices(skus_to_fetch, progress_bar, status_text)
+            # Запускаем парсер асинхронно
+            if sys.platform == 'win32':
+                asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            prices_dict = loop.run_until_complete(fetch_batch_kaspi_prices_async(skus_to_fetch, progress_bar, status_text))
             
             # Перезагружаем из БД, чтобы обновить UI
             st.session_state.df = load_data_from_db()

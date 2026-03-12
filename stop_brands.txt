@@ -596,6 +596,7 @@ Delinia
 Delonghi
 Deltason
 Delux
+Deluxe
 Deluxe Decor
 Demix
 Den store
@@ -2648,3 +2649,4 @@ Viento Tech
 ZAMAN
 test-317
 Газовик
+ONEBOT
