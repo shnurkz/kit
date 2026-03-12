@@ -68,6 +68,15 @@ def load_data_from_db():
             FROM products
         ''', conn)
         
+    try:
+        with open('stop_brands.txt', 'r', encoding='utf-8') as f:
+            stop_brands = {line.strip().lower() for line in f if line.strip()}
+    except FileNotFoundError:
+        stop_brands = set()
+
+    # Safely filter out stop brands
+    db_df = db_df[~db_df['brand'].astype(str).str.lower().str.strip().isin(stop_brands)]
+
     db_df = db_df.rename(columns={
         'supplier_sku': 'Артикул поставщика',
         'supplier_name': 'Наименование',
@@ -462,6 +471,9 @@ if not df.empty:
         display_df = df.copy()
 
     # Пагинация
+    display_df['sku_is_filled'] = display_df['Артикул Каспи'].astype(str).str.strip().astype(bool)
+    display_df = display_df.sort_values(by='sku_is_filled', ascending=True).drop(columns=['sku_is_filled'])
+
     page_size = 50
     total_pages = max(1, len(display_df) // page_size + (1 if len(display_df) % page_size > 0 else 0))
     page_number = st.number_input("Страница", min_value=1, max_value=total_pages, value=1)
@@ -470,11 +482,11 @@ if not df.empty:
     end_idx = start_idx + page_size
     st.session_state.current_page_df = display_df.iloc[start_idx:end_idx]
 
-    # Выводим интерактивную таблицу
     st.data_editor(
         st.session_state.current_page_df, 
         column_order=["Артикул поставщика", "Наименование", "Бренд", "Цена закупа", "Остаток", "Вес (кг)", "Артикул Каспи", "Название Каспи", "Цена на Каспи", "Минимальная цена", "Цена реализации"],
         use_container_width=True,
+        height=1800,
         hide_index=True,
         disabled=["Артикул поставщика", "Наименование", "Бренд", "Цена закупа", "Остаток", "Вес (кг)", "Название Каспи", "Цена на Каспи", "Минимальная цена", "Цена реализации"],
         key="product_editor",
