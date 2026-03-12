@@ -23,6 +23,16 @@ def init_db():
             kaspi_price REAL
         )
         ''')
+        
+        cursor.execute("PRAGMA table_info(products)")
+        columns = [col[1] for col in cursor.fetchall()]
+        if 'weight' not in columns:
+            cursor.execute("ALTER TABLE products ADD COLUMN weight REAL DEFAULT 0.0")
+        if 'min_price' not in columns:
+            cursor.execute("ALTER TABLE products ADD COLUMN min_price REAL DEFAULT 0.0")
+        if 'final_price' not in columns:
+            cursor.execute("ALTER TABLE products ADD COLUMN final_price REAL DEFAULT 0.0")
+            
         conn.commit()
 
 init_db()
@@ -32,19 +42,21 @@ def sync_supplier_to_db(xml_df):
         cursor = conn.cursor()
         for _, row in xml_df.iterrows():
             cursor.execute('''
-            INSERT INTO products (supplier_sku, name, brand, supplier_price, stock, kaspi_sku, kaspi_price)
-            VALUES (?, ?, ?, ?, ?, '', 0.0)
+            INSERT INTO products (supplier_sku, name, brand, supplier_price, stock, kaspi_sku, kaspi_price, weight, min_price, final_price)
+            VALUES (?, ?, ?, ?, ?, '', 0.0, ?, 0.0, 0.0)
             ON CONFLICT(supplier_sku) DO UPDATE SET
                 name = excluded.name,
                 brand = excluded.brand,
                 supplier_price = excluded.supplier_price,
-                stock = excluded.stock
+                stock = excluded.stock,
+                weight = excluded.weight
             ''', (
                 row['Артикул поставщика'],
                 row['Наименование'],
                 row['Бренд'],
                 row['Цена закупа'],
-                row['Остаток']
+                row['Остаток'],
+                row['Вес (кг)']
             ))
         conn.commit()
 
@@ -59,10 +71,11 @@ def load_data_from_db():
         'supplier_price': 'Цена закупа',
         'stock': 'Остаток',
         'kaspi_sku': 'Артикул Каспи',
-        'kaspi_price': 'Цена на Каспи'
+        'kaspi_price': 'Цена на Каспи',
+        'weight': 'Вес (кг)',
+        'min_price': 'Минимальная цена',
+        'final_price': 'Цена реализации'
     })
-    if 'Окончательная цена' not in db_df.columns:
-        db_df['Окончательная цена'] = 0.0
     return db_df
 
 
@@ -97,6 +110,27 @@ def load_and_parse_xml():
             if normalized_vendor in stop_brands:
                 continue
                 
+            price_elem = offer.findtext('purchase_price')
+            if price_elem is None or not price_elem.strip():
+                price_elem = offer.findtext('price', '0')
+            try:
+                purchase_price = float(price_elem)
+            except ValueError:
+                purchase_price = 0.0
+            
+            weight = 0.0
+            for param in offer.findall('param'):
+                if param.get('name') == 'Вес':
+                    weight_text = param.text
+                    if weight_text:
+                        weight_text = weight_text.replace(',', '.')
+                        just_digits_dot = ''.join(c for c in weight_text if c.isdigit() or c == '.')
+                        try:
+                            weight = float(just_digits_dot)
+                        except ValueError:
+                            weight = 0.0
+                    break
+            
             price = offer.findtext('price', '0')
             
             # Ищем остаток (может называться quantity, stock или instock)
@@ -113,11 +147,13 @@ def load_and_parse_xml():
                     'Артикул поставщика': offer_id,
                     'Наименование': name,
                     'Бренд': vendor,
-                    'Цена закупа': float(price),
+                    'Цена закупа': purchase_price,
                     'Остаток': stock_int,
+                    'Вес (кг)': weight,
                     'Артикул Каспи': '',           # Пустое поле для твоего ввода
                     'Цена на Каспи': 0.0,          # Будет заполняться парсером
-                    'Окончательная цена': 0.0      # Будет считаться по формуле
+                    'Минимальная цена': 0.0,       
+                    'Цена реализации': 0.0         
                 })
                 
         return pd.DataFrame(items)
@@ -125,6 +161,45 @@ def load_and_parse_xml():
     except Exception as e:
         st.error(f"Ошибка при скачивании или парсинге XML: {e}")
         return pd.DataFrame()
+
+def calculate_target_prices(purchase_price: float, weight: float, kaspi_competitor_price: float) -> tuple[float, float]:
+    estimated_tier_price = purchase_price / 0.845
+    
+    if estimated_tier_price < 10000:
+        if weight <= 1.0:
+            shipping_cost = 49.14
+        elif weight <= 3.0:
+            shipping_cost = 149.14
+        elif weight <= 5.0:
+            shipping_cost = 199.14
+        else:
+            shipping_cost = 799.14
+    else:
+        if weight < 5.0:
+            shipping_cost = 1299.14
+        elif weight <= 15.0:
+            shipping_cost = 1699.14
+        elif weight <= 30.0:
+            shipping_cost = 3599.14
+        elif weight <= 60.0:
+            shipping_cost = 5649.14
+        elif weight <= 100.0:
+            shipping_cost = 8549.14
+        else:
+            shipping_cost = 11999.14
+            
+    shipping_with_vat = shipping_cost * 1.16
+    min_price = (purchase_price + shipping_with_vat) / 0.845
+    
+    if kaspi_competitor_price > 0:
+        if kaspi_competitor_price > min_price:
+            final_price = kaspi_competitor_price - 5
+        else:
+            final_price = min_price
+    else:
+        final_price = min_price
+        
+    return min_price, final_price
 
 def fetch_batch_kaspi_prices(sku_list: list, progress_bar, status_text) -> dict:
     prices_dict = {}
@@ -186,7 +261,14 @@ def fetch_batch_kaspi_prices(sku_list: list, progress_bar, status_text) -> dict:
                             
                         with sqlite3.connect("mapping.db") as conn:
                             cursor = conn.cursor()
-                            cursor.execute("UPDATE products SET kaspi_price = ? WHERE kaspi_sku = ?", (prices_dict[sku], sku))
+                            cursor.execute("SELECT supplier_price, weight FROM products WHERE kaspi_sku = ?", (sku,))
+                            row_db = cursor.fetchone()
+                            if row_db:
+                                purchase_price, weight = row_db
+                                min_price, final_price = calculate_target_prices(purchase_price, weight, prices_dict[sku])
+                                cursor.execute("UPDATE products SET kaspi_price = ?, min_price = ?, final_price = ? WHERE kaspi_sku = ?", (prices_dict[sku], min_price, final_price, sku))
+                            else:
+                                cursor.execute("UPDATE products SET kaspi_price = ? WHERE kaspi_sku = ?", (prices_dict[sku], sku))
                             conn.commit()
                             
                     except Exception as e:
@@ -222,7 +304,7 @@ if not df.empty:
         df, 
         use_container_width=True,
         hide_index=True,
-        disabled=["Артикул поставщика", "Наименование", "Бренд", "Цена закупа", "Остаток"],
+        disabled=["Артикул поставщика", "Наименование", "Бренд", "Цена закупа", "Остаток", "Вес (кг)", "Минимальная цена", "Цена реализации"],
         key="data_editor"
     )
     
