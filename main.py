@@ -7,6 +7,64 @@ import time
 import traceback
 import sys
 import asyncio
+import sqlite3
+
+def init_db():
+    with sqlite3.connect("mapping.db") as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS products (
+            supplier_sku TEXT PRIMARY KEY,
+            name TEXT,
+            brand TEXT,
+            supplier_price REAL,
+            stock INTEGER,
+            kaspi_sku TEXT,
+            kaspi_price REAL
+        )
+        ''')
+        conn.commit()
+
+init_db()
+
+def sync_supplier_to_db(xml_df):
+    with sqlite3.connect("mapping.db") as conn:
+        cursor = conn.cursor()
+        for _, row in xml_df.iterrows():
+            cursor.execute('''
+            INSERT INTO products (supplier_sku, name, brand, supplier_price, stock, kaspi_sku, kaspi_price)
+            VALUES (?, ?, ?, ?, ?, '', 0.0)
+            ON CONFLICT(supplier_sku) DO UPDATE SET
+                name = excluded.name,
+                brand = excluded.brand,
+                supplier_price = excluded.supplier_price,
+                stock = excluded.stock
+            ''', (
+                row['Артикул поставщика'],
+                row['Наименование'],
+                row['Бренд'],
+                row['Цена закупа'],
+                row['Остаток']
+            ))
+        conn.commit()
+
+def load_data_from_db():
+    with sqlite3.connect("mapping.db") as conn:
+        db_df = pd.read_sql_query("SELECT * FROM products", conn)
+        
+    db_df = db_df.rename(columns={
+        'supplier_sku': 'Артикул поставщика',
+        'name': 'Наименование',
+        'brand': 'Бренд',
+        'supplier_price': 'Цена закупа',
+        'stock': 'Остаток',
+        'kaspi_sku': 'Артикул Каспи',
+        'kaspi_price': 'Цена на Каспи'
+    })
+    if 'Окончательная цена' not in db_df.columns:
+        db_df['Окончательная цена'] = 0.0
+    return db_df
+
 
 # Настройка страницы
 st.set_page_config(page_title="Kaspi Manager", layout="wide")
@@ -68,7 +126,7 @@ def load_and_parse_xml():
         st.error(f"Ошибка при скачивании или парсинге XML: {e}")
         return pd.DataFrame()
 
-def fetch_batch_kaspi_prices(sku_list: list) -> dict:
+def fetch_batch_kaspi_prices(sku_list: list, progress_bar, status_text) -> dict:
     prices_dict = {}
     try:
         if sys.platform == "win32":
@@ -80,7 +138,10 @@ def fetch_batch_kaspi_prices(sku_list: list) -> dict:
             page = context.new_page()
             
             try:
-                for sku in sku_list:
+                for i, sku in enumerate(sku_list):
+                    status_text.text(f"Парсинг артикула {sku} ({i+1}/{len(sku_list)})...")
+                    progress_bar.progress((i + 1) / len(sku_list))
+                    
                     prices_found = []
                     try:
                         page.goto(f"https://kaspi.kz/shop/search/?text={sku}")
@@ -118,9 +179,15 @@ def fetch_batch_kaspi_prices(sku_list: list) -> dict:
                                 prices_found.append(float(just_digits))
                                 
                         if prices_found:
-                            prices_dict[sku] = min(prices_found)
+                            min_price = min(prices_found)
+                            prices_dict[sku] = min_price
                         else:
                             prices_dict[sku] = 0.0
+                            
+                        with sqlite3.connect("mapping.db") as conn:
+                            cursor = conn.cursor()
+                            cursor.execute("UPDATE products SET kaspi_price = ? WHERE kaspi_sku = ?", (prices_dict[sku], sku))
+                            conn.commit()
                             
                     except Exception as e:
                         print(f"Error fetching Kaspi price for {sku}: {traceback.format_exc()}")
@@ -138,8 +205,12 @@ def fetch_batch_kaspi_prices(sku_list: list) -> dict:
 # Загружаем данные
 st.write("Скачивание и обработка прайса Al-Style...")
 
+xml_df = load_and_parse_xml()
+if not xml_df.empty:
+    sync_supplier_to_db(xml_df)
+
 if 'df' not in st.session_state:
-    st.session_state.df = load_and_parse_xml()
+    st.session_state.df = load_data_from_db()
 
 df = st.session_state.df
 
@@ -147,7 +218,7 @@ if not df.empty:
     st.success(f"Успешно загружено товаров (с остатком >= 2): {len(df)}")
     
     # Выводим интерактивную таблицу
-    st.session_state.df = st.data_editor(
+    edited_df = st.data_editor(
         df, 
         use_container_width=True,
         hide_index=True,
@@ -155,32 +226,46 @@ if not df.empty:
         key="data_editor"
     )
     
+    # Мгновенное сохранение ручных изменений артикулов в базу данных
+    for index, row in edited_df.iterrows():
+        old_kaspi_sku = str(df.at[index, 'Артикул Каспи']).strip()
+        new_kaspi_sku = str(row['Артикул Каспи']).strip()
+        
+        if old_kaspi_sku == 'nan': old_kaspi_sku = ''
+        if new_kaspi_sku == 'nan': new_kaspi_sku = ''
+        
+        if old_kaspi_sku != new_kaspi_sku:
+            supplier_sku = row['Артикул поставщика']
+            with sqlite3.connect("mapping.db") as conn:
+                cursor = conn.cursor()
+                cursor.execute("UPDATE products SET kaspi_sku = ? WHERE supplier_sku = ?", (new_kaspi_sku, supplier_sku))
+                conn.commit()
+            st.session_state.df.at[index, 'Артикул Каспи'] = new_kaspi_sku
+
     # Кнопка для запуска парсера
     if st.button("Запросить цены Каспи"):
         st.write("Запускаем сбор цен...")
         
         # Находим строки, где заполнен артикул Каспи
-        valid_rows = st.session_state.df[st.session_state.df['Артикул Каспи'].str.strip() != '']
+        valid_rows = st.session_state.df[st.session_state.df['Артикул Каспи'].astype(str).str.strip() != '']
+        valid_rows = valid_rows[valid_rows['Артикул Каспи'].astype(str).str.strip() != 'nan']
         
         if valid_rows.empty:
             st.warning("Нет заполненных артикулов Каспи для парсинга.")
         else:
-            skus_to_fetch = valid_rows['Артикул Каспи'].str.strip().tolist()
-            st.info(f"Парсинг {len(skus_to_fetch)} товаров в фоне...")
+            skus_to_fetch = valid_rows['Артикул Каспи'].astype(str).str.strip().tolist()
+            progress_bar = st.progress(0)
+            status_text = st.empty()
             
             # Запускаем парсер
-            prices_dict = fetch_batch_kaspi_prices(skus_to_fetch)
+            prices_dict = fetch_batch_kaspi_prices(skus_to_fetch, progress_bar, status_text)
             
-            for index, row in valid_rows.iterrows():
-                sku = str(row['Артикул Каспи']).strip()
-                if sku in prices_dict:
-                    st.session_state.df.at[index, 'Цена на Каспи'] = prices_dict[sku]
+            # Перезагружаем из БД, чтобы обновить UI
+            st.session_state.df = load_data_from_db()
             
+            status_text.text("Парсинг завершен!")
             st.success("Цены обновлены.")
             st.rerun()
 
-    if st.button("Сохранить артикулы в базу"):
-        st.info("Здесь позже прикрутим сохранение в SQLite")
-        
 else:
     st.warning("Нет данных для отображения. Проверь структуру XML-файла.")
