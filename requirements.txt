@@ -1,6 +1,8 @@
-# Dev environment
-pip
-autopep8
-
-# App
-flask
+streamlit
+pandas
+lxml
+requests
+playwright
+beautifulsoup4
+openpyxl
+pyyaml
