@@ -299,6 +299,56 @@ df = st.session_state.df
 if not df.empty:
     st.success(f"Успешно загружено товаров (с остатком >= 2): {len(df)}")
     
+    with st.expander("📦 Добавить свой товар (ручной ввод)"):
+        with st.form("custom_product_form"):
+            col1, col2 = st.columns(2)
+            with col1:
+                custom_sku = st.text_input("Артикул / Код товара (обязательно)")
+                custom_name = st.text_input("Наименование (обязательно)")
+                custom_brand = st.text_input("Бренд")
+            with col2:
+                custom_price = st.number_input("Цена закупа", min_value=0.0, format="%.2f")
+                custom_stock = st.number_input("Остаток на складе", min_value=0, step=1)
+                custom_weight = st.number_input("Вес в кг", min_value=0.0, format="%.3f")
+                custom_kaspi_sku = st.text_input("Артикул Каспи (необязательно)")
+                
+            submitted = st.form_submit_button("Сохранить в базу")
+            
+            if submitted:
+                if custom_sku.strip() and custom_name.strip():
+                    min_price, final_price = calculate_target_prices(custom_price, custom_weight, 0.0)
+                    with sqlite3.connect("mapping.db") as conn:
+                        cursor = conn.cursor()
+                        cursor.execute('''
+                        INSERT INTO products (supplier_sku, name, brand, supplier_price, stock, kaspi_sku, kaspi_price, weight, min_price, final_price)
+                        VALUES (?, ?, ?, ?, ?, ?, 0.0, ?, ?, ?)
+                        ON CONFLICT(supplier_sku) DO UPDATE SET
+                            name = excluded.name,
+                            brand = excluded.brand,
+                            supplier_price = excluded.supplier_price,
+                            stock = excluded.stock,
+                            kaspi_sku = case when excluded.kaspi_sku != '' then excluded.kaspi_sku else kaspi_sku end,
+                            weight = excluded.weight,
+                            min_price = excluded.min_price,
+                            final_price = excluded.final_price
+                        ''', (
+                            custom_sku.strip(), 
+                            custom_name.strip(), 
+                            custom_brand.strip(), 
+                            custom_price, 
+                            custom_stock, 
+                            custom_kaspi_sku.strip(),
+                            custom_weight,
+                            min_price,
+                            final_price
+                        ))
+                        conn.commit()
+                    st.success("Товар успешно добавлен!")
+                    st.session_state.df = load_data_from_db()
+                    st.rerun()
+                else:
+                    st.error("Артикул и Наименование обязательны для заполнения!")
+
     # Выводим интерактивную таблицу
     edited_df = st.data_editor(
         df, 
