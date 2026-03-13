@@ -15,7 +15,7 @@ from streamlit.runtime.scriptrunner import add_script_run_ctx
 from supabase import create_client, Client, ClientOptions
 
 SUPABASE_URL = "https://akrygxdwrwyoaxdsjefs.supabase.co"
-SUPABASE_KEY = "sb_publishable_iaXWAlU-358SXmtzzhDIag_33TiVNj-"
+SUPABASE_KEY = "sb_secret_-6yiRL3AwNCJ3EHqtPW-ww_oiVqN6f_"
 opts = ClientOptions(postgrest_client_timeout=15)
 supabase_client: Client = create_client(SUPABASE_URL, SUPABASE_KEY, options=opts)
 
@@ -414,33 +414,79 @@ async def fetch_batch_kaspi_prices_async(sku_list: list, sku_details: dict, prog
             
     return prices_dict
 
-def generate_kaspi_excel(df: pd.DataFrame) -> bytes:
+def generate_kaspi_xml(df: pd.DataFrame, merchant_id="30391602", city_id="750000000") -> bytes:
+    from datetime import datetime
+    import xml.etree.ElementTree as ET
+    
     filtered_df = df[df['Артикул Каспи'].astype(str).str.strip() != '']
-    filtered_df = filtered_df[filtered_df['Артикул Каспи'].astype(str).str.strip() != 'nan']
+    filtered_df = filtered_df[filtered_df['Артикул Каспи'].astype(str).str.lower() != 'nan']
     
-    kaspi_df = pd.DataFrame()
-    kaspi_df['SKU'] = filtered_df['Артикул Каспи']
-    kaspi_df['model'] = filtered_df['Наименование']
-    kaspi_df['brand'] = filtered_df['Бренд']
-    kaspi_df['price'] = filtered_df['Цена реализации'].fillna(0).astype(int)
-    kaspi_df['PP1'] = filtered_df['Остаток'].fillna(0).astype(int)
-    kaspi_df['PP2'] = 'no'
-    kaspi_df['PP3'] = 'no'
-    kaspi_df['PP4'] = 'no'
-    kaspi_df['PP5'] = 'no'
-    kaspi_df['preorder'] = 0
+    # Create root element with exact namespaces
+    root = ET.Element("kaspi_catalog", {
+        "xmlns": "kaspiShopping",
+        "xmlns:xsi": "http://www.w3.org/2001/XMLSchema-instance",
+        "xsi:schemaLocation": "http://kaspi.kz/kaspishopping.xsd",
+        "date": datetime.now().strftime("%Y-%m-%d %H:%M")
+    })
     
-    output = io.BytesIO()
-    kaspi_df.to_excel(output, index=False, engine='openpyxl')
-    return output.getvalue()
+    ET.SubElement(root, "company").text = merchant_id
+    ET.SubElement(root, "merchantid").text = merchant_id
+    offers = ET.SubElement(root, "offers")
+    
+    for _, row in filtered_df.iterrows():
+        sku = str(row['Артикул Каспи']).strip()
+        offer = ET.SubElement(offers, "offer", sku=sku)
+        
+        # Model (prefer Kaspi name, fallback to Supplier name)
+        model = str(row['Название Каспи']).strip()
+        if not model or model.lower() == 'nan':
+            model = str(row['Наименование']).strip()
+        ET.SubElement(offer, "model").text = model
+        
+        # Brand
+        brand = str(row['Бренд']).strip()
+        if brand and brand.lower() != 'nan':
+            ET.SubElement(offer, "brand").text = brand
+            
+        # Availabilities
+        availabilities = ET.SubElement(offer, "availabilities")
+        try:
+            stock = float(row['Остаток'])
+        except (ValueError, TypeError):
+            stock = 0.0
+            
+        available_str = "yes" if stock > 0 else "no"
+        store_id_str = f"{merchant_id}_PP1"
+        ET.SubElement(availabilities, "availability", 
+                      available=available_str, 
+                      storeId=store_id_str, 
+                      preOrder="0", 
+                      stockCount=f"{stock:.1f}")
+            
+        # City Prices
+        price_val = 0
+        try:
+            price_val = int(float(row['Цена реализации']))
+        except (ValueError, TypeError):
+            pass
+            
+        cityprices = ET.SubElement(offer, "cityprices")
+        ET.SubElement(cityprices, "cityprice", cityId=city_id).text = str(price_val)
+        
+    return ET.tostring(root, encoding='utf-8', xml_declaration=True)
 
-# Загружаем данные
-st.write("Скачивание и обработка прайса Al-Style...")
+# Кнопка для ручного обновления базы от поставщика
+if st.button("🔄 Скачать и обновить прайс Al-Style (Синхронизация)"):
+    st.write("Скачивание и обработка прайса Al-Style...")
+    xml_df = load_and_parse_xml()
+    if not xml_df.empty:
+        sync_supplier_to_db(xml_df)
+        # Force reload data from DB after sync
+        st.session_state.df = load_data_from_db()
+        st.success("База успешно обновлена!")
+        st.rerun()
 
-xml_df = load_and_parse_xml()
-if not xml_df.empty:
-    sync_supplier_to_db(xml_df)
-
+# Инициализация DataFrame в сессии
 if 'df' not in st.session_state:
     st.session_state.df = load_data_from_db()
 
@@ -497,15 +543,36 @@ if not df.empty:
                 else:
                     st.error("Артикул и Наименование обязательны для заполнения!")
 
-    # Кнопка скачивания Excel для Kaspi
-    excel_data = generate_kaspi_excel(df)
-    st.download_button(
-        label="📥 Скачать Excel для Kaspi",
-        data=excel_data,
-        file_name="kaspi_upload.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        type="primary"
-    )
+    # Генерация XML файла для Каспи
+    MERCHANT_ID = "30391602" # Указан ID из примера
+    
+    xml_data = generate_kaspi_xml(df, merchant_id=MERCHANT_ID)
+    
+    col_dl, col_pub = st.columns([1, 2])
+    with col_dl:
+        st.download_button(
+            label="📥 Скачать XML для Kaspi",
+            data=xml_data,
+            file_name="kaspi_prices.xml",
+            mime="application/xml",
+            type="primary"
+        )
+        
+    with col_pub:
+        if st.button("🌐 Опубликовать XML по ссылке"):
+            with st.spinner("Загрузка в облако Supabase..."):
+                try:
+                    res = supabase_client.storage.from_("kaspi").upload(
+                        path="kaspi_prices.xml", 
+                        file=xml_data, 
+                        file_options={"upsert": "true", "contentType": "application/xml"}
+                    )
+                    public_url = supabase_client.storage.from_("kaspi").get_public_url("kaspi_prices.xml")
+                    st.success("✅ XML файл успешно опубликован!")
+                    st.info("Скопируй эту ссылку и вставь в настройки автоматического обновления Каспи:")
+                    st.code(public_url)
+                except Exception as e:
+                    st.error(f"❌ Ошибка публикации. Подробности: {e}")
 
     st.markdown("---")
     
