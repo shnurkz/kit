@@ -10,13 +10,25 @@ import asyncio
 import asyncio
 import io
 import os
-from supabase import create_client, Client
+import threading
+from streamlit.runtime.scriptrunner import add_script_run_ctx
+from supabase import create_client, Client, ClientOptions
 
 SUPABASE_URL = "https://akrygxdwrwyoaxdsjefs.supabase.co"
 SUPABASE_KEY = "sb_publishable_iaXWAlU-358SXmtzzhDIag_33TiVNj-"
-supabase_client: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+opts = ClientOptions(postgrest_client_timeout=15)
+supabase_client: Client = create_client(SUPABASE_URL, SUPABASE_KEY, options=opts)
 
 def sync_supplier_to_db(xml_df):
+    status_text = st.empty()
+    upload_progress = st.progress(0)
+    status_text.text(f"☁️ Начинаю отправку {len(xml_df)} товаров в базу...")
+    
+    BATCH_SIZE = 200
+    batch = []
+    uploaded_count = 0
+    total_products = len(xml_df)
+    
     for _, row in xml_df.iterrows():
         product_data = {
             "supplier_sku": str(row['Артикул поставщика']),
@@ -26,18 +38,54 @@ def sync_supplier_to_db(xml_df):
             "stock": float(row['Остаток']),
             "weight": float(row['Вес (кг)'])
         }
+        batch.append(product_data)
+        
+        if len(batch) >= BATCH_SIZE:
+            try:
+                supabase_client.table('products').upsert(batch).execute()
+                uploaded_count += len(batch)
+                upload_progress.progress(min(uploaded_count / total_products, 1.0))
+                status_text.text(f"☁️ Отправлено в облако: {uploaded_count} из {total_products}...")
+                batch = []
+            except Exception as e:
+                st.error(f"❌ Ошибка сети при отправке данных: {e}")
+                break
+                
+    if batch:
         try:
-            # We first try to select to see if the row exists to do an upsert properly, but supabase upsert using the primary key does this for us.
-            supabase_client.table('products').upsert(product_data).execute()
+            supabase_client.table('products').upsert(batch).execute()
+            uploaded_count += len(batch)
+            upload_progress.progress(1.0)
+            status_text.text(f"☁️ Отправлено в облако: {uploaded_count} из {total_products}...")
         except Exception as e:
-            st.error(f"Error syncing {row['Артикул поставщика']}: {e}")
+            st.error(f"❌ Ошибка при отправке последней пачки: {e}")
+            
+    time.sleep(1)
+    status_text.empty()
+    upload_progress.empty()
 
 def load_data_from_db():
     try:
-        response = supabase_client.table('products').select('*').execute()
-        db_df = pd.DataFrame(response.data)
+        all_data = []
+        start = 0
+        limit = 1000
+        while True:
+            response = supabase_client.table('products').select('*').range(start, start + limit - 1).execute()
+            data = response.data
+            if not data:
+                break
+            all_data.extend(data)
+            if len(data) < limit:
+                break
+            start += limit
+            
+        db_df = pd.DataFrame(all_data)
         if db_df.empty:
             return pd.DataFrame(columns=["supplier_sku", "name", "brand", "supplier_price", "stock", "weight", "kaspi_sku", "kaspi_name", "kaspi_price", "min_price", "final_price"])
+            
+        # Clean string 'None', 'nan', and empty strings
+        db_df = db_df.replace({'None': None, 'none': None, 'NaN': None, 'nan': None, '': None})
+        
     except Exception as e:
         st.error(f"Error loading data from Supabase: {e}")
         return pd.DataFrame(columns=["supplier_sku", "name", "brand", "supplier_price", "stock", "weight", "kaspi_sku", "kaspi_name", "kaspi_price", "min_price", "final_price"])
@@ -94,12 +142,32 @@ st.title("Управление товарами Kaspi")
 @st.cache_data(ttl=600) # Кэшируем данные на 10 минут, чтобы не качать XML при каждом клике
 def load_and_parse_xml():
     url = "https://apifeed.al-style.kz/feed.xml"
+    status_text = st.empty()
+    progress_bar = st.progress(0)
+    
     try:
-        response = requests.get(url)
+        status_text.text("🔌 Подключение к серверу Al-Style...")
+        response = requests.get(url, stream=True, timeout=30)
         response.raise_for_status()
         
-        # Парсим XML
-        root = ET.fromstring(response.content)
+        total_size = int(response.headers.get('content-length', 0))
+        block_size = 1024 * 8
+        downloaded = 0
+        
+        with open('temp_alstyle.xml', 'wb') as f:
+            for data in response.iter_content(block_size):
+                f.write(data)
+                downloaded += len(data)
+                if total_size > 0:
+                    progress_bar.progress(min(downloaded / total_size, 1.0))
+                status_text.text(f"📥 Скачивание прайса: {downloaded / (1024*1024):.2f} MB")
+                
+        status_text.text("✅ Прайс скачан. Начинаю чтение (парсинг) файла...")
+        progress_bar.empty()
+        
+        # Parse the saved XML file
+        tree = ET.parse('temp_alstyle.xml')
+        root = tree.getroot()
         items = []
         
         try:
@@ -108,8 +176,12 @@ def load_and_parse_xml():
         except FileNotFoundError:
             stop_brands = set()
 
-        # Обычно в YML товары лежат в тегах <offer>
-        for offer in root.findall('.//offer'):
+        offers = root.findall('.//offer')
+        total_offers = len(offers)
+        
+        for i, offer in enumerate(offers):
+            if i % 500 == 0:
+                status_text.text(f"⚙️ Обработка товаров: {i} из {total_offers}...")
             offer_id = offer.get('id', '')
             name = offer.findtext('name', 'Без названия')
             vendor = offer.findtext('vendor', 'Неизвестно')
@@ -165,6 +237,7 @@ def load_and_parse_xml():
                     'Цена реализации': 0.0         
                 })
                 
+        status_text.empty()
         return pd.DataFrame(items)
         
     except Exception as e:
@@ -210,7 +283,7 @@ def calculate_target_prices(purchase_price: float, weight: float, kaspi_competit
         
     return min_price, final_price
 
-async def fetch_batch_kaspi_prices_async(sku_list: list, progress_bar, status_text) -> dict:
+async def fetch_batch_kaspi_prices_async(sku_list: list, sku_details: dict, progress_bar, status_text) -> dict:
     prices_dict = {}
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
@@ -247,19 +320,13 @@ async def fetch_batch_kaspi_prices_async(sku_list: list, progress_bar, status_te
                             
                             kaspi_name = ""
                             try:
-                                # Try the user's specific XPath first
-                                name_locator = page.locator('xpath=/html/body/div[1]/div[3]/div/div[2]/div/div[2]/div/div[1]/h1').first
-                                await name_locator.wait_for(state="attached", timeout=3000)
+                                # Use robust CSS selectors: look for common Kaspi title classes or simply the main h1 tag
+                                name_locator = page.locator('.item__name, h1.item__heading, .product-title, h1').first
+                                await name_locator.wait_for(state="attached", timeout=5000)
                                 kaspi_name = await name_locator.inner_text()
-                            except Exception:
-                                try:
-                                    # Fallback to generic h1 with product class
-                                    name_locator = page.locator('h1.item__heading').first
-                                    await name_locator.wait_for(state="attached", timeout=2000)
-                                    kaspi_name = await name_locator.inner_text()
-                                except Exception as e:
-                                    print(f"Name extraction failed for {sku}: {traceback.format_exc()}")
-                                    kaspi_name = ""
+                            except Exception as e:
+                                print(f"Name extraction failed for {sku}: {e}")
+                                kaspi_name = ""
                             kaspi_name = kaspi_name.strip()
                             
                             tab_locator = page.locator('li[data-tab="offers"], a:has-text("Продавцы"), li:has-text("Продавцы")').first
@@ -305,43 +372,41 @@ async def fetch_batch_kaspi_prices_async(sku_list: list, progress_bar, status_te
         tasks = [process_sku(sku, i, len(sku_list)) for i, sku in enumerate(sku_list)]
         results = await asyncio.gather(*tasks)
         
+        # ====== DATABASE UPDATE PHASE ======
+        status_text.text("☁️ Запись новых цен в базу данных...")
+        progress_bar.progress(0.0)
+        total_results = len([r for r in results if r])
+        
+        update_count = 0
         for res in results:
             if not res:
                 continue
             sku, min_price, kaspi_name = res
+            update_count += 1
             
-            prices_dict[sku] = {
-                'min_price': min_price,
-                'kaspi_name': kaspi_name
+            # Update UI so Streamlit doesn't timeout
+            progress_bar.progress(update_count / total_results)
+            status_text.text(f"☁️ Сохранение в базу: {sku} ({update_count}/{total_results})")
+            
+            prices_dict[sku] = {'min_price': min_price, 'kaspi_name': kaspi_name}
+            
+            # Use local memory instead of Supabase select
+            details = sku_details.get(sku, {})
+            purchase_price = details.get('purchase_price', 0.0)
+            weight = details.get('weight', 0.0)
+            
+            calc_min_price, final_price = calculate_target_prices(purchase_price, weight, min_price)
+            
+            update_data = {
+                "kaspi_price": min_price,
+                "min_price": calc_min_price,
+                "final_price": final_price
             }
-            
-            try:
-                response = supabase_client.table('products').select('supplier_price,weight,name').eq('kaspi_sku', sku).execute()
+            if kaspi_name and str(kaspi_name).lower() not in ['none', 'nan', '']:
+                update_data["kaspi_name"] = kaspi_name
                 
-                if response.data and len(response.data) > 0:
-                    row_db = response.data[0]
-                    purchase_price = row_db.get('supplier_price', 0.0)
-                    weight = row_db.get('weight', 0.0)
-                    db_name = row_db.get('name', '')
-                    
-                    calc_min_price, final_price = calculate_target_prices(purchase_price, weight, min_price)
-                    
-                    update_data = {
-                        "kaspi_price": min_price,
-                        "min_price": calc_min_price,
-                        "final_price": final_price
-                    }
-                    if kaspi_name != '':
-                        update_data["name"] = kaspi_name
-                        
-                    supabase_client.table('products').update(update_data).eq("kaspi_sku", sku).execute()
-                else:
-                    update_data = {
-                        "kaspi_price": min_price
-                    }
-                    if kaspi_name != '':
-                        update_data["name"] = kaspi_name
-                    supabase_client.table('products').update(update_data).eq("kaspi_sku", sku).execute()
+            try:
+                supabase_client.table('products').update(update_data).eq("kaspi_sku", sku).execute()
             except Exception as e:
                 print(f"Error updating database for {sku}: {e}")
                 
@@ -474,7 +539,7 @@ if not df.empty:
     st.data_editor(
         st.session_state.current_page_df, 
         column_order=["Артикул поставщика", "Наименование", "Бренд", "Цена закупа", "Остаток", "Вес (кг)", "Артикул Каспи", "Название Каспи", "Цена на Каспи", "Минимальная цена", "Цена реализации"],
-        use_container_width=True,
+        width='stretch',
         height=1800,
         hide_index=True,
         disabled=["Артикул поставщика", "Наименование", "Бренд", "Цена закупа", "Остаток", "Вес (кг)", "Название Каспи", "Цена на Каспи", "Минимальная цена", "Цена реализации"],
@@ -486,23 +551,51 @@ if not df.empty:
     if st.button("Запросить цены Каспи"):
         st.write("Запускаем сбор цен...")
         
-        # Находим строки, где заполнен артикул Каспи
-        valid_rows = st.session_state.df[st.session_state.df['Артикул Каспи'].astype(str).str.strip() != '']
-        valid_rows = valid_rows[valid_rows['Артикул Каспи'].astype(str).str.strip() != 'nan']
+        # Strictly filter out empty strings, pandas NA/NaN, and string representations of 'None' or 'NaN'
+        valid_rows = st.session_state.df[
+            (st.session_state.df['Артикул Каспи'].notna()) & 
+            (st.session_state.df['Артикул Каспи'].astype(str).str.strip() != '') & 
+            (st.session_state.df['Артикул Каспи'].astype(str).str.lower() != 'none') &
+            (st.session_state.df['Артикул Каспи'].astype(str).str.lower() != 'nan')
+        ]
         
         if valid_rows.empty:
             st.warning("Нет заполненных артикулов Каспи для парсинга.")
         else:
             skus_to_fetch = valid_rows['Артикул Каспи'].astype(str).str.strip().tolist()
+            
+            # Prepare local data to avoid DB selects later
+            sku_details = {}
+            for _, row in valid_rows.iterrows():
+                sku = str(row['Артикул Каспи']).strip()
+                sku_details[sku] = {
+                    'purchase_price': float(row['Цена закупа']) if pd.notna(row['Цена закупа']) else 0.0,
+                    'weight': float(row['Вес (кг)']) if pd.notna(row['Вес (кг)']) else 0.0
+                }
+                
             progress_bar = st.progress(0)
             status_text = st.empty()
             
-            # Запускаем парсер асинхронно
-            if sys.platform == 'win32':
-                asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            prices_dict = loop.run_until_complete(fetch_batch_kaspi_prices_async(skus_to_fetch, progress_bar, status_text))
+            # Запускаем парсер в отдельном потоке, чтобы не вешать WebSocket Streamlit
+            result_container = {}
+
+            def background_task():
+                if sys.platform == 'win32':
+                    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                res = loop.run_until_complete(fetch_batch_kaspi_prices_async(skus_to_fetch, sku_details, progress_bar, status_text))
+                result_container['data'] = res
+
+            thread = threading.Thread(target=background_task)
+            add_script_run_ctx(thread) # Позволяет фоновому потоку обновлять st.progress и st.empty
+            thread.start()
+
+            # Главный поток просто ждет, пропуская пинги от браузера, чтобы избежать тайм-аута
+            while thread.is_alive():
+                time.sleep(0.5)
+
+            prices_dict = result_container.get('data', {})
             
             # Перезагружаем из БД, чтобы обновить UI
             st.session_state.df = load_data_from_db()
