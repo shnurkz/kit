@@ -5,6 +5,8 @@ ONEBOT
 1664shop
 19Volt
 21st Scooter
+LG
+X-Game
 2E
 Редмонд
 2V Eyewear
@@ -14,7 +16,10 @@ ONEBOT
 5STAR
 ZOWIE
 70mai
+XG
 Samsung
+HUAWEI eKit
+Huawei
 Mi
 77 Lubricants
 7NEBO HOME
