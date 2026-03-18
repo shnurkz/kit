@@ -29,6 +29,9 @@ def sync_supplier_to_db(xml_df):
     uploaded_count = 0
     total_products = len(xml_df)
     
+    # 1. Track parsed SKUs
+    xml_skus = set(xml_df['Артикул поставщика'].astype(str).tolist())
+    
     for _, row in xml_df.iterrows():
         product_data = {
             "supplier_sku": str(row['Артикул поставщика']),
@@ -59,6 +62,46 @@ def sync_supplier_to_db(xml_df):
             status_text.text(f"☁️ Отправлено в облако: {uploaded_count} из {total_products}...")
         except Exception as e:
             st.error(f"❌ Ошибка при отправке последней пачки: {e}")
+
+    # 2. Find Missing SKUs
+    if 'df' in st.session_state and not st.session_state.df.empty:
+        db_skus = set(st.session_state.df['Артикул поставщика'].astype(str).tolist())
+    else:
+        # Fallback: fetch just the SKUs from Supabase if df is not available
+        db_skus = set()
+        start = 0
+        limit = 1000
+        while True:
+            try:
+                response = supabase_client.table('products').select('supplier_sku').range(start, start + limit - 1).execute()
+                data = response.data
+                if not data: break
+                for d in data:
+                    db_skus.add(str(d.get('supplier_sku', '')))
+                if len(data) < limit: break
+                start += limit
+            except Exception:
+                break
+                
+    # 1. Get the raw missing SKUs (in DB but not in XML)
+    raw_missing_skus = list(db_skus - xml_skus)
+
+    # 2. Filter out manual SKUs (starting with 'm-' or 'M-')
+    missing_skus = [
+        sku for sku in raw_missing_skus 
+        if not str(sku).lower().startswith('m-')
+    ]
+    
+    # 3. Zero Out Stock for Missing SKUs in Supabase
+    if missing_skus:
+        status_text.text(f"🧹 Обнуление остатков для {len(missing_skus)} снятых с продажи товаров...")
+        chunk_size = 200
+        for i in range(0, len(missing_skus), chunk_size):
+            chunk = missing_skus[i:i + chunk_size]
+            try:
+                supabase_client.table('products').update({"stock": 0}).in_("supplier_sku", chunk).execute()
+            except Exception as e:
+                print(f"Error zeroing stock for chunk: {e}")
             
     time.sleep(1)
     status_text.empty()
@@ -411,31 +454,37 @@ async def fetch_batch_kaspi_prices_async(sku_list: list, sku_details: dict, prog
             # Save the absolute floor to the database as our min_price
             m_price = breakeven_price
 
-            # 2. Determine final_price based on competitor (min_price)
-            if min_price and min_price > 0:
-                if min_price > target_price:
-                    # Competitor is high, we can comfortably undercut and still make MORE than our target profit
-                    f_price = min_price - 5
-                elif min_price > breakeven_price:
-                    # Competitor is between our breakeven and target profit. Undercut to win the buybox.
-                    # We make less than 500 KZT, but strictly >= 0 KZT.
-                    f_price = max(breakeven_price, min_price - 5)
+            # 1. Safely parse scraped Kaspi price and our calculated min_price
+            try:
+                k_price_val = float(min_price) if pd.notna(min_price) and min_price else 0.0
+            except (ValueError, TypeError):
+                k_price_val = 0.0
+
+            try:
+                m_price_val = float(m_price) if pd.notna(m_price) and m_price else 0.0
+            except (ValueError, TypeError):
+                m_price_val = 0.0
+
+            # 2. Strict undercutting logic
+            if k_price_val > 0:
+                if m_price_val < k_price_val:
+                    # We can afford to undercut. Subtract exactly 5 KZT from the competitor.
+                    # Use max() to ensure we NEVER drop below our m_price_val.
+                    f_price_val = max(m_price_val, k_price_val - 5)
                 else:
-                    # Competitor is dumping below our breakeven (e.g., 6318 vs our 6949).
-                    # DO NOT follow them down. Sit at our breakeven and wait.
-                    f_price = breakeven_price
+                    # Competitor is dumping at or below our minimum limit. Do not follow them down.
+                    f_price_val = m_price_val
             else:
-                # No competitors, set to our target profitable price
-                f_price = target_price
+                # No competitors found on Kaspi
+                f_price_val = m_price_val
 
-            # Ensure we are not undercutting ourselves (self-dumping prevention).
-            # If the scraped competitor price (min_price) is EXACTLY equal to our current final_price or breakeven_price, 
-            # we assume it's our own listing and we don't drop by 5 KZT.
-            if min_price == f_price + 5 or min_price == f_price:
-                f_price = min_price
+            # 3. Convert back to integer for database saving
+            f_price = int(f_price_val)
+            m_price = int(m_price_val)
 
+            # 4. Prepare the exact payload for Supabase update
             update_data = {
-                "kaspi_price": min_price,
+                "kaspi_price": int(k_price_val) if k_price_val > 0 else 0,
                 "min_price": m_price,
                 "final_price": f_price
             }
@@ -631,9 +680,13 @@ if not df.empty:
     else:
         display_df = df.copy()
 
-    # Пагинация
-    display_df['sku_is_filled'] = display_df['Артикул Каспи'].astype(str).str.strip().astype(bool)
-    display_df = display_df.sort_values(by='sku_is_filled', ascending=True).drop(columns=['sku_is_filled'])
+    # Пагинация и сортировка (пустые Артикулы Каспи наверх)
+    mask = display_df['Артикул Каспи'].notna() & \
+           (display_df['Артикул Каспи'].astype(str).str.strip() != '') & \
+           (display_df['Артикул Каспи'].astype(str).str.lower() != 'none') & \
+           (display_df['Артикул Каспи'].astype(str).str.lower() != 'nan')
+           
+    display_df = pd.concat([display_df[~mask], display_df[mask]]).reset_index(drop=True)
 
     page_size = 50
     total_pages = max(1, len(display_df) // page_size + (1 if len(display_df) % page_size > 0 else 0))
@@ -641,10 +694,37 @@ if not df.empty:
     
     start_idx = (page_number - 1) * page_size
     end_idx = start_idx + page_size
-    st.session_state.current_page_df = display_df.iloc[start_idx:end_idx]
+    current_page = display_df.iloc[start_idx:end_idx].copy()
+    
+    price_cols = ['Цена закупа', 'Цена на Каспи', 'Минимальная цена', 'Цена реализации']
+    for col in price_cols:
+        if col in current_page.columns:
+            current_page[col] = pd.to_numeric(current_page[col], errors='coerce').astype('Int64')
+            
+    st.session_state.current_page_df = current_page
+
+    def highlight_prices(row):
+        styles = [''] * len(row)
+        try:
+            m_val = float(row['Минимальная цена'])
+            k_val = float(row['Цена на Каспи'])
+            
+            if pd.notna(m_val) and pd.notna(k_val) and k_val > 0:
+                # Find the index of the min_price column safely
+                if 'Минимальная цена' in row.index:
+                    col_idx = row.index.get_loc('Минимальная цена')
+                    if m_val < k_val:
+                        styles[col_idx] = 'color: #006400;' # Dark Green
+                    elif m_val > k_val:
+                        styles[col_idx] = 'color: #FF0000;' # Red
+        except (ValueError, TypeError):
+            pass
+        return styles
+
+    styled_df = st.session_state.current_page_df.style.apply(highlight_prices, axis=1)
 
     st.data_editor(
-        st.session_state.current_page_df, 
+        styled_df, 
         column_order=["Артикул поставщика", "Наименование", "Бренд", "Цена закупа", "Остаток", "Вес (кг)", "Артикул Каспи", "Название Каспи", "Цена на Каспи", "Минимальная цена", "Цена реализации"],
         width='stretch',
         height=1800,
