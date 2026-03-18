@@ -244,44 +244,53 @@ def load_and_parse_xml():
         st.error(f"Ошибка при скачивании или парсинге XML: {e}")
         return pd.DataFrame()
 
-def calculate_target_prices(purchase_price: float, weight: float, kaspi_competitor_price: float) -> tuple[float, float]:
-    estimated_tier_price = purchase_price / 0.845
-    
-    if estimated_tier_price < 10000:
-        if weight <= 1.0:
-            shipping_cost = 49.14
-        elif weight <= 3.0:
-            shipping_cost = 149.14
-        elif weight <= 5.0:
-            shipping_cost = 199.14
-        else:
-            shipping_cost = 799.14
-    else:
-        if weight < 5.0:
-            shipping_cost = 1299.14
-        elif weight <= 15.0:
-            shipping_cost = 1699.14
-        elif weight <= 30.0:
-            shipping_cost = 3599.14
-        elif weight <= 60.0:
-            shipping_cost = 5649.14
-        elif weight <= 100.0:
-            shipping_cost = 8549.14
-        else:
-            shipping_cost = 11999.14
-            
-    shipping_with_vat = shipping_cost * 1.16
-    min_price = (purchase_price + shipping_with_vat) / 0.845
-    
-    if kaspi_competitor_price > 0:
-        if kaspi_competitor_price > min_price:
-            final_price = kaspi_competitor_price - 5
-        else:
-            final_price = min_price
-    else:
-        final_price = min_price
+def calculate_price_for_profit(supplier_price, weight=0, target_profit=0):
+    if not supplier_price or pd.isna(supplier_price):
+        return 0
         
-    return min_price, final_price
+    COEFF = 0.845  # 1 - (12.5% Kaspi Fee + 3% Tax)
+    VAT = 1.16     # 16% VAT added to base delivery cost
+    
+    def calc_price(delivery_base):
+        delivery_with_vat = delivery_base * VAT
+        return (supplier_price + delivery_with_vat + target_profit) / COEFF
+
+    # Check price-based tiers (< 10,000 KZT)
+    price = calc_price(49.14)
+    if price <= 999: return round(price)
+    
+    price = calc_price(99.14)
+    if price <= 2000: return round(price)
+    
+    price = calc_price(199.14)
+    if price <= 3000: return round(price)
+    
+    price = calc_price(399.14)
+    if price <= 5000: return round(price)
+    
+    price = calc_price(799.14)
+    if price <= 10000: return round(price)
+    
+    # If selling price is > 10,000 KZT, delivery is weight-based
+    try:
+        w = float(weight) if pd.notna(weight) and weight else 0.0
+    except ValueError:
+        w = 0.0
+        
+    if w <= 5:
+        delivery_base = 1299.14
+    elif w <= 10:
+        delivery_base = 1699.14
+    elif w <= 15:
+        delivery_base = 2199.14
+    elif w <= 20:
+        delivery_base = 2599.14
+    elif w <= 30:
+        delivery_base = 3499.14
+    else:
+        delivery_base = 5000.0 # Fallback for very heavy items
+        
+    return round(calc_price(delivery_base))
 
 async def fetch_batch_kaspi_prices_async(sku_list: list, sku_details: dict, progress_bar, status_text) -> dict:
     prices_dict = {}
@@ -395,12 +404,40 @@ async def fetch_batch_kaspi_prices_async(sku_list: list, sku_details: dict, prog
             purchase_price = details.get('purchase_price', 0.0)
             weight = details.get('weight', 0.0)
             
-            calc_min_price, final_price = calculate_target_prices(purchase_price, weight, min_price)
-            
+            # 1. Calculate our absolute floor (0 profit) and our target (500 profit)
+            breakeven_price = calculate_price_for_profit(supplier_price=purchase_price, weight=weight, target_profit=0)
+            target_price = calculate_price_for_profit(supplier_price=purchase_price, weight=weight, target_profit=500)
+
+            # Save the absolute floor to the database as our min_price
+            m_price = breakeven_price
+
+            # 2. Determine final_price based on competitor (min_price)
+            if min_price and min_price > 0:
+                if min_price > target_price:
+                    # Competitor is high, we can comfortably undercut and still make MORE than our target profit
+                    f_price = min_price - 5
+                elif min_price > breakeven_price:
+                    # Competitor is between our breakeven and target profit. Undercut to win the buybox.
+                    # We make less than 500 KZT, but strictly >= 0 KZT.
+                    f_price = max(breakeven_price, min_price - 5)
+                else:
+                    # Competitor is dumping below our breakeven (e.g., 6318 vs our 6949).
+                    # DO NOT follow them down. Sit at our breakeven and wait.
+                    f_price = breakeven_price
+            else:
+                # No competitors, set to our target profitable price
+                f_price = target_price
+
+            # Ensure we are not undercutting ourselves (self-dumping prevention).
+            # If the scraped competitor price (min_price) is EXACTLY equal to our current final_price or breakeven_price, 
+            # we assume it's our own listing and we don't drop by 5 KZT.
+            if min_price == f_price + 5 or min_price == f_price:
+                f_price = min_price
+
             update_data = {
                 "kaspi_price": min_price,
-                "min_price": calc_min_price,
-                "final_price": final_price
+                "min_price": m_price,
+                "final_price": f_price
             }
             if kaspi_name and str(kaspi_name).lower() not in ['none', 'nan', '']:
                 update_data["kaspi_name"] = kaspi_name
@@ -512,7 +549,10 @@ if not df.empty:
             
             if submitted:
                 if custom_sku.strip() and custom_name.strip():
-                    min_price, final_price = calculate_target_prices(custom_price, custom_weight, 0.0)
+                    breakeven_price = calculate_price_for_profit(supplier_price=custom_price, weight=custom_weight, target_profit=0)
+                    target_price = calculate_price_for_profit(supplier_price=custom_price, weight=custom_weight, target_profit=500)
+                    m_price = breakeven_price
+                    f_price = target_price
                     try:
                         product_data = {
                             "supplier_sku": custom_sku.strip(),
@@ -522,8 +562,8 @@ if not df.empty:
                             "stock": custom_stock,
                             "kaspi_sku": custom_kaspi_sku.strip(),
                             "weight": custom_weight,
-                            "min_price": min_price,
-                            "final_price": final_price
+                            "min_price": m_price,
+                            "final_price": f_price
                         }
                         
                         # First check if it exists so we don't accidentally blank out kaspi_price
