@@ -164,8 +164,8 @@ def save_table_edits():
         edited_rows = st.session_state["product_editor"].get("edited_rows", {})
         for row_idx, changes in edited_rows.items():
             if 'current_page_df' in st.session_state and row_idx < len(st.session_state.current_page_df):
-                actual_index = st.session_state.current_page_df.index[row_idx]
-                supplier_sku = st.session_state.df.at[actual_index, 'Артикул поставщика']
+                actual_index = int(row_idx)
+                supplier_sku = st.session_state.current_page_df.iloc[actual_index]['Артикул поставщика']
                 
                 if 'Артикул Каспи' in changes:
                     new_sku = str(changes['Артикул Каспи']).strip()
@@ -176,7 +176,10 @@ def save_table_edits():
                     except Exception as e:
                         st.error(f"Error updating SKU: {e}")
                     
-                    st.session_state.df.at[actual_index, 'Артикул Каспи'] = new_sku
+                    # Update the main df safely by finding the matching sku
+                    mask = st.session_state.df['Артикул поставщика'] == supplier_sku
+                    if mask.any():
+                        st.session_state.df.loc[mask, 'Артикул Каспи'] = new_sku
 
 # Настройка страницы
 st.set_page_config(page_title="Kaspi Manager", layout="wide")
@@ -695,6 +698,7 @@ if not df.empty:
     start_idx = (page_number - 1) * page_size
     end_idx = start_idx + page_size
     current_page = display_df.iloc[start_idx:end_idx].copy()
+    current_page.reset_index(drop=True, inplace=True)
     
     price_cols = ['Цена закупа', 'Цена на Каспи', 'Минимальная цена', 'Цена реализации']
     for col in price_cols:
