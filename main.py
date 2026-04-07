@@ -39,7 +39,8 @@ def sync_supplier_to_db(xml_df):
             "brand": str(row['Бренд']),
             "supplier_price": float(row['Цена закупа']),
             "stock": float(row['Остаток']),
-            "weight": float(row['Вес (кг)'])
+            "weight": float(row['Вес (кг)']),
+            "preorder": 1
         }
         batch.append(product_data)
         
@@ -124,14 +125,20 @@ def load_data_from_db():
             
         db_df = pd.DataFrame(all_data)
         if db_df.empty:
-            return pd.DataFrame(columns=["supplier_sku", "name", "brand", "supplier_price", "stock", "weight", "kaspi_sku", "kaspi_name", "kaspi_price", "min_price", "final_price"])
+            return pd.DataFrame(columns=["supplier_sku", "name", "brand", "supplier_price", "stock", "weight", "kaspi_sku", "kaspi_name", "kaspi_price", "min_price", "final_price", "preorder"])
+            
+        if 'preorder' not in db_df.columns:
+            db_df['preorder'] = 1
             
         # Clean string 'None', 'nan', and empty strings
         db_df = db_df.replace({'None': None, 'none': None, 'NaN': None, 'nan': None, '': None})
         
+        # Ensure preorder is integer where possible
+        db_df['preorder'] = pd.to_numeric(db_df['preorder'], errors='coerce').fillna(1).astype(int)
+        
     except Exception as e:
         st.error(f"Error loading data from Supabase: {e}")
-        return pd.DataFrame(columns=["supplier_sku", "name", "brand", "supplier_price", "stock", "weight", "kaspi_sku", "kaspi_name", "kaspi_price", "min_price", "final_price"])
+        return pd.DataFrame(columns=["supplier_sku", "name", "brand", "supplier_price", "stock", "weight", "kaspi_sku", "kaspi_name", "kaspi_price", "min_price", "final_price", "preorder"])
         
     db_df = db_df.rename(columns={'name': 'supplier_name'})
         
@@ -155,7 +162,8 @@ def load_data_from_db():
         'kaspi_price': 'Цена на Каспи',
         'weight': 'Вес (кг)',
         'min_price': 'Минимальная цена',
-        'final_price': 'Цена реализации'
+        'final_price': 'Цена реализации',
+        'preorder': 'Предзаказ'
     })
     return db_df
 
@@ -167,19 +175,32 @@ def save_table_edits():
                 actual_index = int(row_idx)
                 supplier_sku = st.session_state.current_page_df.iloc[actual_index]['Артикул поставщика']
                 
+                update_data = {}
                 if 'Артикул Каспи' in changes:
                     new_sku = str(changes['Артикул Каспи']).strip()
                     if new_sku == 'nan': new_sku = ''
+                    update_data["kaspi_sku"] = new_sku
                     
+                if 'Предзаказ' in changes:
                     try:
-                        supabase_client.table('products').update({"kaspi_sku": new_sku}).eq("supplier_sku", supplier_sku).execute()
+                        new_preorder = int(changes['Предзаказ'])
+                    except (ValueError, TypeError):
+                        new_preorder = 1
+                    update_data["preorder"] = new_preorder
+
+                if update_data:
+                    try:
+                        supabase_client.table('products').update(update_data).eq("supplier_sku", supplier_sku).execute()
                     except Exception as e:
-                        st.error(f"Error updating SKU: {e}")
+                        st.error(f"Error updating database: {e}")
                     
                     # Update the main df safely by finding the matching sku
                     mask = st.session_state.df['Артикул поставщика'] == supplier_sku
                     if mask.any():
-                        st.session_state.df.loc[mask, 'Артикул Каспи'] = new_sku
+                        if 'kaspi_sku' in update_data:
+                            st.session_state.df.loc[mask, 'Артикул Каспи'] = update_data["kaspi_sku"]
+                        if 'preorder' in update_data:
+                            st.session_state.df.loc[mask, 'Предзаказ'] = update_data["preorder"]
 
 # Настройка страницы
 st.set_page_config(page_title="Kaspi Manager", layout="wide")
@@ -280,7 +301,8 @@ def load_and_parse_xml():
                     'Название Каспи': '',
                     'Цена на Каспи': 0.0,          # Будет заполняться парсером
                     'Минимальная цена': 0.0,       
-                    'Цена реализации': 0.0         
+                    'Цена реализации': 0.0,
+                    'Предзаказ': 1
                 })
                 
         status_text.empty()
@@ -471,11 +493,18 @@ async def fetch_batch_kaspi_prices_async(sku_list: list, sku_details: dict, prog
             # 2. Strict undercutting logic
             if k_price_val > 0:
                 if m_price_val < k_price_val:
-                    # We can afford to undercut. Subtract exactly 5 KZT from the competitor.
-                    # Use max() to ensure we NEVER drop below our m_price_val.
-                    f_price_val = max(m_price_val, k_price_val - 5)
+                    # Достаем срок предзаказа (если не найден, по умолчанию 1)
+                    preorder_days = details.get('preorder', 0)
+                    
+                    if preorder_days > 3:
+                        # Агрессивный демпинг: -20% от цены конкурента для товаров из Китая
+                        calculated_price = k_price_val * 0.8
+                        f_price_val = max(m_price_val, calculated_price)
+                    else:
+                        # Стандартный демпинг: -5 тенге для товаров в наличии (1-3 дня)
+                        f_price_val = max(m_price_val, k_price_val - 5)
                 else:
-                    # Competitor is dumping at or below our minimum limit. Do not follow them down.
+                    # Конкурент продает ниже нашего дна. Не опускаемся ниже min_price.
                     f_price_val = m_price_val
             else:
                 # No competitors found on Kaspi
@@ -546,10 +575,22 @@ def generate_kaspi_xml(df: pd.DataFrame, merchant_id="30391602", city_id="750000
             
         available_str = "yes" if stock > 0 else "no"
         store_id_str = f"{merchant_id}_PP1"
+        
+        supplier_sku = str(row.get('Артикул поставщика', '')).strip()
+        is_manual = supplier_sku.lower().startswith('m-')
+        if not is_manual:
+            preorder_val = "1" # Для Al-Style всегда ставим 1 день
+        else:
+            try:
+                preorder_val = str(int(row.get('Предзаказ', 1)))
+            except:
+                preorder_val = "1"
+                
+        # Каспи использует атрибут preOrder внутри тега availability
         ET.SubElement(availabilities, "availability", 
                       available=available_str, 
                       storeId=store_id_str, 
-                      preOrder="0", 
+                      preOrder=preorder_val, 
                       stockCount=f"{stock:.1f}")
             
         # City Prices
@@ -588,7 +629,7 @@ if not df.empty:
         with st.form("custom_product_form"):
             col1, col2 = st.columns(2)
             with col1:
-                custom_sku = st.text_input("Артикул / Код товара (обязательно)")
+                custom_sku = st.text_input("Артикул / Код товара (будет добавлен префикс m-)")
                 custom_name = st.text_input("Наименование (обязательно)")
                 custom_brand = st.text_input("Бренд")
             with col2:
@@ -596,6 +637,7 @@ if not df.empty:
                 custom_stock = st.number_input("Остаток на складе", min_value=0, step=1)
                 custom_weight = st.number_input("Вес в кг", min_value=0.0, format="%.3f")
                 custom_kaspi_sku = st.text_input("Артикул Каспи (необязательно)")
+                custom_preorder = st.number_input("Срок предзаказа (дней)", min_value=0, max_value=30, value=15)
                 
             submitted = st.form_submit_button("Сохранить в базу")
             
@@ -605,9 +647,15 @@ if not df.empty:
                     target_price = calculate_price_for_profit(supplier_price=custom_price, weight=custom_weight, target_profit=500)
                     m_price = breakeven_price
                     f_price = target_price
+                    
+                    # Принудительно добавляем m-, чтобы система знала, что это ручной товар
+                    sku_val = custom_sku.strip()
+                    if not sku_val.lower().startswith('m-'):
+                        sku_val = f"m-{sku_val}"
+                        
                     try:
                         product_data = {
-                            "supplier_sku": custom_sku.strip(),
+                            "supplier_sku": sku_val,
                             "name": custom_name.strip(),
                             "brand": custom_brand.strip(),
                             "supplier_price": custom_price,
@@ -615,11 +663,11 @@ if not df.empty:
                             "kaspi_sku": custom_kaspi_sku.strip(),
                             "weight": custom_weight,
                             "min_price": m_price,
-                            "final_price": f_price
+                            "final_price": f_price,
+                            "preorder": custom_preorder
                         }
                         
-                        # First check if it exists so we don't accidentally blank out kaspi_price
-                        existing = supabase_client.table('products').select('*').eq('supplier_sku', custom_sku.strip()).execute()
+                        existing = supabase_client.table('products').select('*').eq('supplier_sku', sku_val).execute()
                         if not existing.data or len(existing.data) == 0:
                             product_data["kaspi_price"] = 0.0
                         else:
@@ -729,7 +777,7 @@ if not df.empty:
 
     st.data_editor(
         styled_df, 
-        column_order=["Артикул поставщика", "Наименование", "Бренд", "Цена закупа", "Остаток", "Вес (кг)", "Артикул Каспи", "Название Каспи", "Цена на Каспи", "Минимальная цена", "Цена реализации"],
+        column_order=["Артикул поставщика", "Наименование", "Бренд", "Цена закупа", "Остаток", "Вес (кг)", "Предзаказ", "Артикул Каспи", "Название Каспи", "Цена на Каспи", "Минимальная цена", "Цена реализации"],
         width='stretch',
         height=1800,
         hide_index=True,
@@ -761,7 +809,8 @@ if not df.empty:
                 sku = str(row['Артикул Каспи']).strip()
                 sku_details[sku] = {
                     'purchase_price': float(row['Цена закупа']) if pd.notna(row['Цена закупа']) else 0.0,
-                    'weight': float(row['Вес (кг)']) if pd.notna(row['Вес (кг)']) else 0.0
+                    'weight': float(row['Вес (кг)']) if pd.notna(row['Вес (кг)']) else 0.0,
+                    'preorder': int(row['Предзаказ']) if pd.notna(row['Предзаказ']) else 1
                 }
                 
             progress_bar = st.progress(0)
