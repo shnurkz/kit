@@ -129,16 +129,22 @@ def load_data_from_db():
             
         if 'preorder' not in db_df.columns:
             db_df['preorder'] = 1
+        if 'is_approved' not in db_df.columns:
+            db_df['is_approved'] = False
+        if 'ai_confidence' not in db_df.columns:
+            db_df['ai_confidence'] = 0
             
         # Clean string 'None', 'nan', and empty strings
         db_df = db_df.replace({'None': None, 'none': None, 'NaN': None, 'nan': None, '': None})
         
-        # Ensure preorder is integer where possible
+        # Ensure prefix typing
         db_df['preorder'] = pd.to_numeric(db_df['preorder'], errors='coerce').fillna(1).astype(int)
+        db_df['ai_confidence'] = pd.to_numeric(db_df['ai_confidence'], errors='coerce').fillna(0).astype(int)
+        db_df['is_approved'] = db_df['is_approved'].fillna(False).astype(bool)
         
     except Exception as e:
         st.error(f"Error loading data from Supabase: {e}")
-        return pd.DataFrame(columns=["supplier_sku", "name", "brand", "supplier_price", "stock", "weight", "kaspi_sku", "kaspi_name", "kaspi_price", "min_price", "final_price", "preorder"])
+        return pd.DataFrame(columns=["supplier_sku", "name", "brand", "supplier_price", "stock", "weight", "kaspi_sku", "kaspi_name", "kaspi_price", "min_price", "final_price", "preorder", "is_approved", "ai_confidence"])
         
     db_df = db_df.rename(columns={'name': 'supplier_name'})
         
@@ -163,7 +169,9 @@ def load_data_from_db():
         'weight': 'Вес (кг)',
         'min_price': 'Минимальная цена',
         'final_price': 'Цена реализации',
-        'preorder': 'Предзаказ'
+        'preorder': 'Предзаказ',
+        'is_approved': 'Одобрен',
+        'ai_confidence': 'Уверенность ИИ'
     })
     return db_df
 
@@ -180,6 +188,7 @@ def save_table_edits():
                     new_sku = str(changes['Артикул Каспи']).strip()
                     if new_sku == 'nan': new_sku = ''
                     update_data["kaspi_sku"] = new_sku
+                    update_data["is_approved"] = True
                     
                 if 'Предзаказ' in changes:
                     try:
@@ -201,6 +210,8 @@ def save_table_edits():
                             st.session_state.df.loc[mask, 'Артикул Каспи'] = update_data["kaspi_sku"]
                         if 'preorder' in update_data:
                             st.session_state.df.loc[mask, 'Предзаказ'] = update_data["preorder"]
+                        if 'is_approved' in update_data:
+                            st.session_state.df.loc[mask, 'Одобрен'] = update_data["is_approved"]
 
 # Настройка страницы
 st.set_page_config(page_title="Kaspi Manager", layout="wide")
@@ -539,6 +550,11 @@ def generate_kaspi_xml(df: pd.DataFrame, merchant_id="30391602", city_id="750000
     filtered_df = df[df['Артикул Каспи'].astype(str).str.strip() != '']
     filtered_df = filtered_df[filtered_df['Артикул Каспи'].astype(str).str.lower() != 'nan']
     
+    # Выгружаем только ручные товары или те, у которых is_approved == True
+    is_approved_mask = filtered_df.get('Одобрен', pd.Series([False]*len(filtered_df))) == True
+    is_manual_mask = filtered_df['Артикул поставщика'].astype(str).str.lower().str.startswith('m-')
+    filtered_df = filtered_df[is_approved_mask | is_manual_mask]
+    
     # Create root element with exact namespaces
     root = ET.Element("kaspi_catalog", {
         "xmlns": "kaspiShopping",
@@ -653,7 +669,8 @@ if not df.empty:
                             "weight": custom_weight,
                             "min_price": m_price,
                             "final_price": f_price,
-                            "preorder": custom_preorder
+                            "preorder": custom_preorder,
+                            "is_approved": True
                         }
                         
                         existing = supabase_client.table('products').select('*').eq('supplier_sku', sku_val).execute()
@@ -671,6 +688,50 @@ if not df.empty:
                         st.error(f"Error saving product: {e}")
                 else:
                     st.error("Артикул и Наименование обязательны для заполнения!")
+
+    with st.expander("🤖 Модерация ИИ (проверка найденных артикулов)"):
+        # Filter df where kaspi_sku is not null but Одобрен is False
+        mod_mask = (
+            df['Артикул Каспи'].notna() & 
+            (df['Артикул Каспи'].astype(str).str.strip() != '') & 
+            (df['Артикул Каспи'].astype(str).str.lower() != 'none') &
+            (df['Артикул Каспи'].astype(str).str.lower() != 'nan') &
+            (df.get('Одобрен', pd.Series([False]*len(df))) == False) &
+            (~df['Артикул поставщика'].astype(str).str.lower().str.startswith('m-'))
+        )
+        mod_df = df[mod_mask].copy()
+        
+        if mod_df.empty:
+            st.info("Нет товаров, требующих проверки ИИ.")
+        else:
+            mod_display = mod_df[['Артикул поставщика', 'Наименование', 'Бренд', 'Цена закупа', 'Артикул Каспи', 'Уверенность ИИ']].copy()
+            mod_display['Одобрить'] = False
+            
+            st.write(f"Ожидают проверки: {len(mod_df)} товаров")
+            
+            edited_mod_df = st.data_editor(
+                mod_display,
+                column_config={
+                    "Одобрить": st.column_config.CheckboxColumn("Одобрить", help="Отметьте, чтобы подтвердить артикул"),
+                    "Уверенность ИИ": st.column_config.ProgressColumn("Уверенность ИИ", format="%d%%", min_value=0, max_value=100)
+                },
+                disabled=["Артикул поставщика", "Наименование", "Бренд", "Цена закупа", "Артикул Каспи", "Уверенность ИИ"],
+                hide_index=True,
+                key="mod_editor"
+            )
+            
+            if st.button("Сохранить проверенные"):
+                approved_skus = edited_mod_df[edited_mod_df['Одобрить'] == True]['Артикул поставщика'].tolist()
+                if approved_skus:
+                    try:
+                        supabase_client.table('products').update({"is_approved": True}).in_("supplier_sku", approved_skus).execute()
+                        st.success(f"Одобрено {len(approved_skus)} товаров!")
+                        st.session_state.df = load_data_from_db()
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Ошибка сохранения: {e}")
+                else:
+                    st.warning("Ни один товар не отмечен для одобрения.")
 
     # Генерация XML файла для Каспи
     MERCHANT_ID = "30391602" # Указан ID из примера
