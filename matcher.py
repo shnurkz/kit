@@ -137,13 +137,21 @@ def main():
                         
                     try:
                         desc_loc = candidate_page.locator('.item__description, .description, p').first
-                        desc = desc_loc.inner_text().strip()[:300] if desc_loc.count() > 0 else ""
+                        if desc_loc.count() > 0:
+                            desc_text = desc_loc.inner_text().strip()
+                            desc = desc_text[:500] + "..." if len(desc_text) > 500 else desc_text
+                        else:
+                            desc = ""
                     except:
                         desc = ""
                         
                     try:
                         spec_loc = candidate_page.locator('dl, .specifications, .item__specifications').first
-                        specs = spec_loc.inner_text().strip()[:300] if spec_loc.count() > 0 else ""
+                        if spec_loc.count() > 0:
+                            spec_text = spec_loc.inner_text().strip()
+                            specs = spec_text[:800] + "..." if len(spec_text) > 800 else spec_text
+                        else:
+                            specs = ""
                     except:
                         specs = ""
                         

@@ -801,7 +801,13 @@ if not df.empty:
     price_cols = ['Цена закупа', 'Цена на Каспи', 'Минимальная цена', 'Цена реализации']
     for col in price_cols:
         if col in current_page.columns:
-            current_page[col] = pd.to_numeric(current_page[col], errors='coerce').astype('Int64')
+            temp_numeric = pd.to_numeric(current_page[col], errors='coerce')
+            try:
+                # Пробуем округлить и привести к целому (Int64 поддерживает NaN)
+                current_page[col] = temp_numeric.round().astype('Int64')
+            except TypeError:
+                # Если данные сопротивляются безопасному касту, оставляем их как float64
+                current_page[col] = temp_numeric.astype('float64')
             
     st.session_state.current_page_df = current_page
 
