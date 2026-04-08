@@ -576,21 +576,10 @@ def generate_kaspi_xml(df: pd.DataFrame, merchant_id="30391602", city_id="750000
         available_str = "yes" if stock > 0 else "no"
         store_id_str = f"{merchant_id}_PP1"
         
-        supplier_sku = str(row.get('Артикул поставщика', '')).strip()
-        is_manual = supplier_sku.lower().startswith('m-')
-        if not is_manual:
-            preorder_val = "1" # Для Al-Style всегда ставим 1 день
-        else:
-            try:
-                preorder_val = str(int(row.get('Предзаказ', 1)))
-            except:
-                preorder_val = "1"
-                
-        # Каспи использует атрибут preOrder внутри тега availability
         ET.SubElement(availabilities, "availability", 
                       available=available_str, 
                       storeId=store_id_str, 
-                      preOrder=preorder_val, 
+                      preOrder="0", 
                       stockCount=f"{stock:.1f}")
             
         # City Prices
