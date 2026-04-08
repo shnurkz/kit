@@ -36,7 +36,7 @@ def get_unmatched_products():
     return unmatched
 
 def query_ollama(db_name, db_price, candidates_text):
-    prompt_text = f"""Ты парсер. Мой товар: {db_name}. Мой закуп: {db_price}. Вот 3 кандидата с Kaspi: 
+    prompt_text = f"""Ты парсер. Мой товар: {db_name}. Мой закуп: {db_price}. Вот до 7 кандидатов с Kaspi: 
 {candidates_text}
 
 Найди точное совпадение. Верни СТРОГО JSON: {{"best_sku": "артикул", "confidence": число_от_0_до_100}}. Если ничего не подходит, верни best_sku: null."""
@@ -72,7 +72,7 @@ def main():
         context = browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36")
         
         for i, item in enumerate(items):
-            db_name = f"{item.get('brand', '')} {item.get('name', '')}".strip()
+            db_name = f"{item.get('name', '')}".strip()
             db_price = item.get('supplier_price', 0)
             
             print(f"\n[{i+1}/{len(items)}] 📦 Ищем: {db_name}")
@@ -81,67 +81,68 @@ def main():
             safe_query = urllib.parse.quote(db_name.replace("+", " "))
             search_url = f"https://kaspi.kz/shop/search/?text={safe_query}"
             
-            page = context.new_page()
+            search_page = context.new_page()
+            search_page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "font", "media"] else route.continue_())
             
-            # Блокируем лишние ресурсы для скорости и защищаемся от бана
-            page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "font", "media"] else route.continue_())
-            
+            unique_urls = []
             try:
-                page.goto(search_url, wait_until="domcontentloaded")
-                page.wait_for_timeout(3000) # пауза, чтобы Каспи не забанил
+                search_page.goto(search_url, wait_until="domcontentloaded")
+                search_page.wait_for_timeout(3000) # пауза, чтобы Каспи не забанил
                 
                 try:
-                    page.wait_for_selector('.item-card, .a-card, a[href*="/p/"]', timeout=5000)
+                    search_page.wait_for_selector('.item-card, .a-card, a[href*="/p/"]', timeout=5000)
                 except Exception:
                     print("⚠️ Не найдены карточки товаров на странице поиска.")
-                    page.close()
-                    continue
+                else:
+                    links = search_page.locator('a[href*="/p/"]').element_handles()
+                    for link in links:
+                        href = link.get_attribute('href')
+                        if href and '/p/' in href:
+                            full_url = f"https://kaspi.kz{href}" if href.startswith('/') else href
+                            clean_href = full_url.split('?')[0] # очищаем от параметров
+                            if clean_href not in unique_urls:
+                                unique_urls.append(clean_href)
+                        if len(unique_urls) == 7:
+                            break
+            except Exception as e:
+                print(f"❌ Ошибка поиска товара: {e}")
+            finally:
+                search_page.close()
                 
-                # Собираем уникальные ссылки первых 3 товаров
-                links = page.locator('a[href*="/p/"]').element_handles()
+            if not unique_urls:
+                print("⚠️ Ссылки на товары не найдены.")
+                continue
                 
-                unique_urls = []
-                for link in links:
-                    href = link.get_attribute('href')
-                    if href and '/p/' in href:
-                        full_url = f"https://kaspi.kz{href}" if href.startswith('/') else href
-                        clean_href = full_url.split('?')[0] # очищаем от параметров
-                        if clean_href not in unique_urls:
-                            unique_urls.append(clean_href)
-                    if len(unique_urls) == 3:
-                        break
-                        
-                if not unique_urls:
-                    print("⚠️ Ссылки на товары не найдены.")
-                    page.close()
-                    continue
-                    
-                candidates = []
+            candidates = []
+            
+            for idx, url in enumerate(unique_urls):
+                candidate_page = context.new_page()
+                candidate_page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "font", "media"] else route.continue_())
                 
-                for idx, url in enumerate(unique_urls):
-                    page.goto(url, wait_until="domcontentloaded")
-                    page.wait_for_timeout(3000) # пауза перед чтением карточки
+                try:
+                    candidate_page.goto(url, wait_until="domcontentloaded", timeout=15000)
+                    candidate_page.wait_for_timeout(3000) # пауза перед чтением карточки
                     
                     try:
-                        title_loc = page.locator('h1').first
+                        title_loc = candidate_page.locator('h1').first
                         title = title_loc.inner_text().strip() if title_loc.count() > 0 else "Нет названия"
                     except:
                         title = "Нет названия"
                         
                     try:
-                        price_loc = page.locator('.item__price-once, .item__price').first
+                        price_loc = candidate_page.locator('.item__price-once, .item__price').first
                         price = price_loc.inner_text().strip() if price_loc.count() > 0 else "Нет цены"
                     except:
                         price = "Нет цены"
                         
                     try:
-                        desc_loc = page.locator('.item__description, .description, p').first
+                        desc_loc = candidate_page.locator('.item__description, .description, p').first
                         desc = desc_loc.inner_text().strip()[:300] if desc_loc.count() > 0 else ""
                     except:
                         desc = ""
                         
                     try:
-                        spec_loc = page.locator('dl, .specifications, .item__specifications').first
+                        spec_loc = candidate_page.locator('dl, .specifications, .item__specifications').first
                         specs = spec_loc.inner_text().strip()[:300] if spec_loc.count() > 0 else ""
                     except:
                         specs = ""
@@ -150,34 +151,39 @@ def main():
                     
                     candidate_text = f"{idx+1}:\nSKU: {sku}\nНазвание: {title}\nЦена: {price}\nОписание: {desc}\nХарактеристики: {specs}\n---\n"
                     candidates.append(candidate_text)
-                    
-                candidates_str = "\n".join(candidates)
-                
-                print(f"🤖 Передаем {len(candidates)} кандидатов нейросети Ollama...")
-                ai_result = query_ollama(db_name, db_price, candidates_str)
-                
-                best_sku = ai_result.get("best_sku")
-                confidence = ai_result.get("confidence", 0)
-                
-                if best_sku:
-                    print(f"✅ Ollama выбрала SKU: {best_sku} с уверенностью {confidence}%! Сохраняю...")
-                    try:
-                        supabase.table('products').update({
-                            "kaspi_sku": str(best_sku),
-                            "ai_confidence": int(confidence),
-                            "is_approved": False
-                        }).eq("supplier_sku", item['supplier_sku']).execute()
-                        print("💾 Сохранено!")
-                    except Exception as e:
-                        print(f"❌ Ошибка сохранения в БД: {e}")
-                else:
-                    print(f"⏭️ Ни один кандидат не подошел (Отказ от Ollama).")
-                    
-            except Exception as e:
-                print(f"❌ Ошибка обработки товара: {e}")
-            finally:
-                page.close()
+                except Exception as e:
+                    print(f"⚠️ Ошибка парсинга карточки {url}: {e}")
+                finally:
+                    candidate_page.close()
+            
+            if not candidates:
+                print("⏭️ Ни одной карточки не удалось прочесть.")
                 time.sleep(2)
+                continue
+                
+            candidates_str = "\n".join(candidates)
+            
+            print(f"🤖 Передаем {len(candidates)} кандидатов нейросети Ollama...")
+            ai_result = query_ollama(db_name, db_price, candidates_str)
+            
+            best_sku = ai_result.get("best_sku")
+            confidence = ai_result.get("confidence", 0)
+            
+            if best_sku:
+                print(f"✅ Ollama выбрала SKU: {best_sku} с уверенностью {confidence}%! Сохраняю...")
+                try:
+                    supabase.table('products').update({
+                        "kaspi_sku": str(best_sku),
+                        "ai_confidence": int(confidence),
+                        "is_approved": False
+                    }).eq("supplier_sku", item['supplier_sku']).execute()
+                    print("💾 Сохранено!")
+                except Exception as e:
+                    print(f"❌ Ошибка сохранения в БД: {e}")
+            else:
+                print(f"⏭️ Ни один кандидат не подошел (Отказ от Ollama).")
+                
+            time.sleep(2)
 
         print("\n🏁 Сессия маппинга завершена!")
         browser.close()
