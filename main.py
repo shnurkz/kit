@@ -16,7 +16,8 @@ from supabase import create_client, Client, ClientOptions
 import core_updater
 
 SUPABASE_URL = "https://akrygxdwrwyoaxdsjefs.supabase.co"
-SUPABASE_KEY = "sb_secret_-6yiRL3AwNCJ3EHqtPW-ww_oiVqN6f_"
+SUPABASE_KEY = "sb_secret_qJMop48AytfDJQyWvEFhBA_nM_cv7yv"
+
 opts = ClientOptions(postgrest_client_timeout=15)
 supabase_client: Client = create_client(SUPABASE_URL, SUPABASE_KEY, options=opts)
 
