@@ -19,8 +19,11 @@ if sys.platform == 'win32':
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("core_updater")
 
-SUPABASE_URL = "https://akrygxdwrwyoaxdsjefs.supabase.co"
-SUPABASE_KEY = "sb_secret_-6yiRL3AwNCJ3EHqtPW-ww_oiVqN6f_"
+from dotenv import load_dotenv
+load_dotenv()
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 opts = ClientOptions(postgrest_client_timeout=15)
 supabase_client: Client = create_client(SUPABASE_URL, SUPABASE_KEY, options=opts)
 
@@ -145,6 +148,10 @@ def load_and_parse_xml(
             except ValueError:
                 purchase_price = 0.0
             
+            # У всех товаров от поставщика с себестоимостью менее 500 000 тенге отнимаем 6% от цены закупа
+            if 0 < purchase_price < 500000:
+                purchase_price = round(purchase_price * 0.94, 2)
+            
             weight = 0.0
             for param in offer.findall('param'):
                 if param.get('name') == 'Вес':
@@ -182,7 +189,7 @@ def load_and_parse_xml(
                     'Цена на Каспи': 0.0,
                     'Минимальная цена': 0.0,       
                     'Цена реализации': 0.0,
-                    'Предзаказ': 1
+                    'Предзаказ': 4
                 })
                 
         return pd.DataFrame(items)
@@ -222,7 +229,7 @@ def sync_supplier_to_db(
             "supplier_price": float(row['Цена закупа']),
             "stock": float(row['Остаток']),
             "weight": float(row['Вес (кг)']),
-            "preorder": 1
+            "preorder": 4
         }
         batch.append(product_data)
         

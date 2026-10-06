@@ -5,9 +5,13 @@ import time
 from supabase import create_client, Client, ClientOptions
 from playwright.sync_api import sync_playwright
 
+import os
+from dotenv import load_dotenv
+load_dotenv()
+
 # Доступы к Supabase (используем service_role ключ)
-SUPABASE_URL = "https://akrygxdwrwyoaxdsjefs.supabase.co"
-SUPABASE_KEY = "sb_secret_-6yiRL3AwNCJ3EHqtPW-ww_oiVqN6f_"
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 opts = ClientOptions(postgrest_client_timeout=15)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY, options=opts)
 

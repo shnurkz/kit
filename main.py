@@ -15,8 +15,11 @@ from streamlit.runtime.scriptrunner import add_script_run_ctx
 from supabase import create_client, Client, ClientOptions
 import core_updater
 
-SUPABASE_URL = "https://akrygxdwrwyoaxdsjefs.supabase.co"
-SUPABASE_KEY = "sb_secret_qJMop48AytfDJQyWvEFhBA_nM_cv7yv"
+from dotenv import load_dotenv
+load_dotenv()
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 opts = ClientOptions(postgrest_client_timeout=15)
 supabase_client: Client = create_client(SUPABASE_URL, SUPABASE_KEY, options=opts)
@@ -54,7 +57,7 @@ def load_data_from_db():
         start = 0
         limit = 1000
         while True:
-            response = supabase_client.table('products').select('*').range(start, start + limit - 1).execute()
+            response = supabase_client.table('products').select('*').order('supplier_sku').range(start, start + limit - 1).execute()
             data = response.data
             if not data:
                 break
@@ -68,7 +71,7 @@ def load_data_from_db():
             return pd.DataFrame(columns=["supplier_sku", "name", "brand", "supplier_price", "stock", "weight", "kaspi_sku", "kaspi_name", "kaspi_price", "min_price", "final_price", "preorder"])
             
         if 'preorder' not in db_df.columns:
-            db_df['preorder'] = 1
+            db_df['preorder'] = 4
         if 'is_approved' not in db_df.columns:
             db_df['is_approved'] = False
         if 'ai_confidence' not in db_df.columns:
@@ -78,9 +81,16 @@ def load_data_from_db():
         db_df = db_df.replace({'None': None, 'none': None, 'NaN': None, 'nan': None, '': None})
         
         # Ensure prefix typing
-        db_df['preorder'] = pd.to_numeric(db_df['preorder'], errors='coerce').fillna(1).astype(int)
+        db_df['preorder'] = pd.to_numeric(db_df['preorder'], errors='coerce').fillna(4).astype(int)
         db_df['ai_confidence'] = pd.to_numeric(db_df['ai_confidence'], errors='coerce').fillna(0).astype(int)
         db_df['is_approved'] = db_df['is_approved'].fillna(False).astype(bool)
+
+        # Товар не может считаться одобренным, если у него отсутствует Артикул Каспи
+        invalid_sku_mask = (
+            db_df['kaspi_sku'].isna() | 
+            db_df['kaspi_sku'].astype(str).str.strip().str.lower().isin(['', 'none', 'nan', 'null'])
+        )
+        db_df.loc[invalid_sku_mask, 'is_approved'] = False
         
     except Exception as e:
         st.error(f"Error loading data from Supabase: {e}")
@@ -118,40 +128,58 @@ def load_data_from_db():
 def save_table_edits():
     if "product_editor" in st.session_state:
         edited_rows = st.session_state["product_editor"].get("edited_rows", {})
-        for row_idx, changes in edited_rows.items():
-            if 'current_page_df' in st.session_state and row_idx < len(st.session_state.current_page_df):
-                actual_index = int(row_idx)
+        page_skus = st.session_state.get('editor_page_skus', [])
+        
+        for row_idx, changes in list(edited_rows.items()):
+            actual_index = int(row_idx)
+            supplier_sku = None
+            if actual_index < len(page_skus):
+                supplier_sku = page_skus[actual_index]
+            elif 'current_page_df' in st.session_state and actual_index < len(st.session_state.current_page_df):
                 supplier_sku = st.session_state.current_page_df.iloc[actual_index]['Артикул поставщика']
                 
-                update_data = {}
-                if 'Артикул Каспи' in changes:
-                    new_sku = str(changes['Артикул Каспи']).strip()
-                    if new_sku == 'nan': new_sku = ''
-                    update_data["kaspi_sku"] = new_sku
-                    update_data["is_approved"] = True
-                    
-                if 'Предзаказ' in changes:
-                    try:
-                        new_preorder = int(changes['Предзаказ'])
-                    except (ValueError, TypeError):
-                        new_preorder = 1
-                    update_data["preorder"] = new_preorder
+            if not supplier_sku:
+                continue
+                
+            update_data = {}
+            if 'Артикул Каспи' in changes:
+                new_sku = str(changes['Артикул Каспи']).strip()
+                if new_sku.lower() in ('nan', 'none', 'null', ''):
+                    new_sku = ''
+                update_data["kaspi_sku"] = new_sku
+                update_data["is_approved"] = True if new_sku else False
+                
+            if 'Предзаказ' in changes:
+                try:
+                    new_preorder = int(changes['Предзаказ'])
+                except (ValueError, TypeError):
+                    new_preorder = 4
+                update_data["preorder"] = new_preorder
 
-                if update_data:
-                    try:
-                        supabase_client.table('products').update(update_data).eq("supplier_sku", supplier_sku).execute()
-                    except Exception as e:
-                        st.error(f"Error updating database: {e}")
-                    
-                    # Update the main df safely by finding the matching sku
-                    mask = st.session_state.df['Артикул поставщика'] == supplier_sku
-                    if mask.any():
+            if update_data:
+                try:
+                    supabase_client.table('products').update(update_data).eq("supplier_sku", supplier_sku).execute()
+                except Exception as e:
+                    st.error(f"Error updating database: {e}")
+                
+                # Update the main df safely by finding the matching sku
+                mask = st.session_state.df['Артикул поставщика'] == supplier_sku
+                if mask.any():
+                    if 'kaspi_sku' in update_data:
+                        st.session_state.df.loc[mask, 'Артикул Каспи'] = update_data["kaspi_sku"]
+                    if 'preorder' in update_data:
+                        st.session_state.df.loc[mask, 'Предзаказ'] = update_data["preorder"]
+                    if 'is_approved' in update_data:
+                        st.session_state.df.loc[mask, 'Одобрен'] = update_data["is_approved"]
+                        
+                    # Also update current_page_df safely
+                    if 'current_page_df' in st.session_state and actual_index < len(st.session_state.current_page_df):
                         if 'kaspi_sku' in update_data:
-                            st.session_state.df.loc[mask, 'Артикул Каспи'] = update_data["kaspi_sku"]
+                            st.session_state.current_page_df.loc[actual_index, 'Артикул Каспи'] = update_data["kaspi_sku"]
                         if 'preorder' in update_data:
-                            st.session_state.df.loc[mask, 'Предзаказ'] = update_data["preorder"]
+                            st.session_state.current_page_df.loc[actual_index, 'Предзаказ'] = update_data["preorder"]
                         if 'is_approved' in update_data:
-                            st.session_state.df.loc[mask, 'Одобрен'] = update_data["is_approved"]
+                            st.session_state.current_page_df.loc[actual_index, 'Одобрен'] = update_data["is_approved"]
 
 # Настройка страницы
 st.set_page_config(page_title="Kaspi Manager", layout="wide")
@@ -320,12 +348,12 @@ async def fetch_batch_kaspi_prices_async(sku_list: list, sku_details: dict, prog
                     # Достаем срок предзаказа (если не найден, по умолчанию 1)
                     preorder_days = details.get('preorder', 0)
                     
-                    if preorder_days > 3:
-                        # Агрессивный демпинг: -20% от цены конкурента для товаров из Китая
+                    if preorder_days > 4:
+                        # Агрессивный демпинг: -20% от цены конкурента для товаров из Китая (предзаказ более 4 дней)
                         calculated_price = k_price_val * 0.8
                         f_price_val = max(m_price_val, calculated_price)
                     else:
-                        # Стандартный демпинг: -5 тенге для товаров в наличии (1-3 дня)
+                        # Стандартный демпинг: -5 тенге для товаров в наличии / от поставщика (до 4 дней)
                         f_price_val = max(m_price_val, k_price_val - 5)
                 else:
                     # Конкурент продает ниже нашего дна. Не опускаемся ниже min_price.
@@ -347,8 +375,12 @@ async def fetch_batch_kaspi_prices_async(sku_list: list, sku_details: dict, prog
             if kaspi_name and str(kaspi_name).lower() not in ['none', 'nan', '']:
                 update_data["kaspi_name"] = kaspi_name
                 
+            supplier_sku = details.get('supplier_sku')
             try:
-                supabase_client.table('products').update(update_data).eq("kaspi_sku", sku).execute()
+                if supplier_sku:
+                    supabase_client.table('products').update(update_data).eq("supplier_sku", supplier_sku).execute()
+                else:
+                    supabase_client.table('products').update(update_data).eq("kaspi_sku", sku).execute()
             except Exception as e:
                 print(f"Error updating database for {sku}: {e}")
                 
@@ -356,72 +388,174 @@ async def fetch_batch_kaspi_prices_async(sku_list: list, sku_details: dict, prog
             
     return prices_dict
 
-def generate_kaspi_xml(df: pd.DataFrame, merchant_id="30391602", city_id="750000000") -> bytes:
+def get_exportable_products(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Фильтрует товары для выгрузки в Kaspi XML.
+    В выгрузку попадают ТОЛЬКО товары со всеми заполненными обязательными полями:
+    1. Артикул Каспи (не пустой, не None, не nan, не null)
+    2. Цена реализации (число > 0)
+    3. Наименование / Название Каспи (не пустое)
+    4. Бренд (не пустой)
+    5. Статус: одобрен (Одобрен == True) или ручной товар (m-)
+    """
+    if df is None or df.empty:
+        return pd.DataFrame(columns=df.columns if df is not None else [])
+
+    sku_col = 'Артикул Каспи' if 'Артикул Каспи' in df.columns else 'kaspi_sku'
+    approved_col = 'Одобрен' if 'Одобрен' in df.columns else 'is_approved'
+    supplier_sku_col = 'Артикул поставщика' if 'Артикул поставщика' in df.columns else 'supplier_sku'
+    price_col = 'Цена реализации' if 'Цена реализации' in df.columns else 'final_price'
+    kaspi_name_col = 'Название Каспи' if 'Название Каспи' in df.columns else 'kaspi_name'
+    name_col = 'Наименование' if 'Наименование' in df.columns else 'name'
+    brand_col = 'Бренд' if 'Бренд' in df.columns else 'brand'
+
+    # 1. Валидный Артикул Каспи
+    valid_sku = (
+        df[sku_col].notna() &
+        (df[sku_col].astype(str).str.strip() != '') &
+        (~df[sku_col].astype(str).str.strip().str.lower().isin(['none', 'nan', 'null']))
+    )
+
+    # 2. Одобрен или ручной товар (префикс m-)
+    is_approved = (df[approved_col] == True) if approved_col in df.columns else pd.Series(False, index=df.index)
+    is_manual = (
+        df[supplier_sku_col].astype(str).str.strip().str.lower().str.startswith('m-')
+        if supplier_sku_col in df.columns else pd.Series(False, index=df.index)
+    )
+    valid_approval = is_approved | is_manual
+
+    # 3. Валидная цена реализации (> 0)
+    numeric_prices = pd.to_numeric(df[price_col], errors='coerce') if price_col in df.columns else pd.Series(0, index=df.index)
+    valid_price = numeric_prices.notna() & (numeric_prices > 0)
+
+    # 4. Валидное наименование / модель (хотя бы одно из полей не пустое)
+    has_kaspi_name = (
+        df[kaspi_name_col].notna() &
+        (df[kaspi_name_col].astype(str).str.strip() != '') &
+        (~df[kaspi_name_col].astype(str).str.strip().str.lower().isin(['none', 'nan', 'null']))
+    ) if kaspi_name_col in df.columns else pd.Series(False, index=df.index)
+
+    has_supplier_name = (
+        df[name_col].notna() &
+        (df[name_col].astype(str).str.strip() != '') &
+        (~df[name_col].astype(str).str.strip().str.lower().isin(['none', 'nan', 'null']))
+    ) if name_col in df.columns else pd.Series(False, index=df.index)
+
+    valid_model = has_kaspi_name | has_supplier_name
+
+    # 5. Валидный бренд
+    valid_brand = (
+        df[brand_col].notna() &
+        (df[brand_col].astype(str).str.strip() != '') &
+        (~df[brand_col].astype(str).str.strip().str.lower().isin(['none', 'nan', 'null']))
+    ) if brand_col in df.columns else pd.Series(False, index=df.index)
+
+    mask = valid_sku & valid_approval & valid_price & valid_model & valid_brand
+    return df[mask].copy()
+
+def generate_kaspi_xml(df: pd.DataFrame, merchant_id="30391602", city_id="750000000", store_id="PP1") -> bytes:
     from datetime import datetime
     import xml.etree.ElementTree as ET
     
-    filtered_df = df[df['Артикул Каспи'].astype(str).str.strip() != '']
-    filtered_df = filtered_df[filtered_df['Артикул Каспи'].astype(str).str.lower() != 'nan']
-    
-    # Выгружаем только ручные товары или те, у которых is_approved == True
-    is_approved_mask = filtered_df.get('Одобрен', pd.Series([False]*len(filtered_df))) == True
-    is_manual_mask = filtered_df['Артикул поставщика'].astype(str).str.lower().str.startswith('m-')
-    filtered_df = filtered_df[is_approved_mask | is_manual_mask]
+    filtered_df = get_exportable_products(df)
     
     # Create root element with exact namespaces
     root = ET.Element("kaspi_catalog", {
         "xmlns": "kaspiShopping",
         "xmlns:xsi": "http://www.w3.org/2001/XMLSchema-instance",
-        "xsi:schemaLocation": "http://kaspi.kz/kaspishopping.xsd",
+        "xsi:schemaLocation": "kaspiShopping http://kaspi.kz/kaspishopping.xsd",
         "date": datetime.now().strftime("%Y-%m-%d %H:%M")
     })
     
-    ET.SubElement(root, "company").text = merchant_id
-    ET.SubElement(root, "merchantid").text = merchant_id
+    ET.SubElement(root, "company").text = str(merchant_id).strip()
+    ET.SubElement(root, "merchantid").text = str(merchant_id).strip()
     offers = ET.SubElement(root, "offers")
     
+    # Поддерживаем один или несколько кодов складов (через запятую)
+    stores = [s.strip() for s in str(store_id).split(',') if s.strip()]
+    if not stores:
+        stores = ["PP1"]
+        
     for _, row in filtered_df.iterrows():
-        sku = str(row['Артикул Каспи']).strip()
-        offer = ET.SubElement(offers, "offer", sku=sku)
-        
+        sku_val = row.get('Артикул Каспи', row.get('kaspi_sku', ''))
+        if pd.isna(sku_val) or sku_val is None:
+            continue
+        sku = str(sku_val).strip()
+        if not sku or sku.lower() in ('none', 'nan', 'null'):
+            continue
+
         # Model (prefer Kaspi name, fallback to Supplier name)
-        model = str(row['Название Каспи']).strip()
-        if not model or model.lower() == 'nan':
-            model = str(row['Наименование']).strip()
-        ET.SubElement(offer, "model").text = model
-        
+        model = str(row.get('Название Каспи', row.get('kaspi_name', '')) or '').strip()
+        if not model or model.lower() in ('none', 'nan', 'null'):
+            model = str(row.get('Наименование', row.get('name', '')) or '').strip()
+        if not model or model.lower() in ('none', 'nan', 'null'):
+            continue
+
         # Brand
-        brand = str(row['Бренд']).strip()
-        if brand and brand.lower() != 'nan':
-            ET.SubElement(offer, "brand").text = brand
+        brand = str(row.get('Бренд', row.get('brand', '')) or '').strip()
+        if not brand or brand.lower() in ('none', 'nan', 'null'):
+            continue
+
+        # City Prices
+        try:
+            price_val = int(round(float(row.get('Цена реализации', row.get('final_price', 0)))))
+        except (ValueError, TypeError):
+            price_val = 0
+            
+        if price_val <= 0:
+            continue
+
+        offer = ET.SubElement(offers, "offer", sku=sku)
+        ET.SubElement(offer, "model").text = model
+        ET.SubElement(offer, "brand").text = brand
             
         # Availabilities
         availabilities = ET.SubElement(offer, "availabilities")
         try:
-            stock = float(row['Остаток'])
+            stock = float(row.get('Остаток', row.get('stock', 0)))
         except (ValueError, TypeError):
             stock = 0.0
             
-        available_str = "yes" if stock > 0 else "no"
-        store_id_str = f"{merchant_id}_PP1"
+        # Kaspi требует строго целое число для stockCount (например, 30, а не 30.0)
+        stock_int = max(0, int(round(stock)))
+        available_str = "yes" if stock_int > 0 else "no"
         
-        ET.SubElement(availabilities, "availability", 
-                      available=available_str, 
-                      storeId=store_id_str, 
-                      preOrder="0", 
-                      stockCount=f"{stock:.1f}")
-            
-        # City Prices
-        price_val = 0
-        try:
-            price_val = int(float(row['Цена реализации']))
-        except (ValueError, TypeError):
-            pass
+        # Срок предзаказа (preOrder):
+        # Для ручных товаров (с префиксом 'm-') берем значение из поля 'Предзаказ'
+        # Для всех остальных товаров по умолчанию 4
+        supplier_sku = str(row.get('Артикул поставщика', row.get('supplier_sku', '')) or '').strip()
+        is_manual = supplier_sku.lower().startswith('m-')
+        if is_manual:
+            preorder_raw = row.get('Предзаказ', row.get('preorder'))
+            if pd.notna(preorder_raw) and str(preorder_raw).strip() != '':
+                try:
+                    preorder_val = int(float(preorder_raw))
+                except (ValueError, TypeError):
+                    preorder_val = 0
+            else:
+                preorder_val = 0
+        else:
+            preorder_val = 4
+        
+        for st_code in stores:
+            avail_attrs = {
+                "available": available_str,
+                "storeId": st_code,
+                "stockCount": str(stock_int)
+            }
+            # preOrder передается только если он больше 0 (стандарт Kaspi)
+            if preorder_val > 0:
+                avail_attrs["preOrder"] = str(preorder_val)
+                
+            ET.SubElement(availabilities, "availability", avail_attrs)
             
         cityprices = ET.SubElement(offer, "cityprices")
-        ET.SubElement(cityprices, "cityprice", cityId=city_id).text = str(price_val)
+        ET.SubElement(cityprices, "cityprice", cityId=str(city_id).strip()).text = str(price_val)
         
-    return ET.tostring(root, encoding='utf-8', xml_declaration=True)
+    # Форматирование XML с отступами и стандартной кодировкой UTF-8 без BOM
+    ET.indent(root, space="    ")
+    xml_str = '<?xml version="1.0" encoding="UTF-8"?>\n' + ET.tostring(root, encoding='unicode')
+    return xml_str.encode('utf-8')
 
 # Кнопка для ручного обновления базы от поставщика
 if st.button("🔄 Скачать и обновить прайс Al-Style (Синхронизация)"):
@@ -483,7 +617,7 @@ if not df.empty:
                             "min_price": m_price,
                             "final_price": f_price,
                             "preorder": custom_preorder,
-                            "is_approved": True
+                            "is_approved": bool(custom_kaspi_sku.strip())
                         }
                         
                         existing = supabase_client.table('products').select('*').eq('supplier_sku', sku_val).execute()
@@ -547,9 +681,30 @@ if not df.empty:
                     st.warning("Ни один товар не отмечен для одобрения.")
 
     # Генерация XML файла для Каспи
-    MERCHANT_ID = "30391602" # Указан ID из примера
+    st.subheader("📄 Экспорт прайс-листа в Kaspi XML")
     
-    xml_data = generate_kaspi_xml(df, merchant_id=MERCHANT_ID)
+    exportable_df = get_exportable_products(df)
+    st.info(f"📊 Готово к выгрузке в Kaspi: **{len(exportable_df)}** товаров (все обязательные поля заполнены: артикул Каспи, цена > 0, название, бренд).")
+    
+    with st.expander("⚙️ Настройки выгрузки Kaspi XML", expanded=False):
+        col_cfg1, col_cfg2, col_cfg3 = st.columns(3)
+        with col_cfg1:
+            merchant_id_input = st.text_input("Merchant ID", value="30391602", help="Ваш ID продавца в Kaspi")
+        with col_cfg2:
+            store_id_input = st.text_input("Код склада (storeId)", value="PP1", help="Код склада из кабинета Kaspi ('Склады и магазины'). По умолчанию 'PP1'. Можно через запятую, например 'PP1, PP2'.")
+        with col_cfg3:
+            city_id_input = st.text_input("Код города (cityId)", value="750000000", help="Код города (750000000 для Алматы)")
+
+    actual_merchant_id = merchant_id_input.strip() if 'merchant_id_input' in locals() and merchant_id_input.strip() else "30391602"
+    actual_store_id = store_id_input.strip() if 'store_id_input' in locals() and store_id_input.strip() else "PP1"
+    actual_city_id = city_id_input.strip() if 'city_id_input' in locals() and city_id_input.strip() else "750000000"
+
+    xml_data = generate_kaspi_xml(
+        df, 
+        merchant_id=actual_merchant_id, 
+        city_id=actual_city_id, 
+        store_id=actual_store_id
+    )
     
     col_dl, col_pub = st.columns([1, 2])
     with col_dl:
@@ -557,7 +712,7 @@ if not df.empty:
             label="📥 Скачать XML для Kaspi",
             data=xml_data,
             file_name="kaspi_prices.xml",
-            mime="application/xml",
+            mime="application/xml; charset=utf-8",
             type="primary"
         )
         
@@ -568,7 +723,7 @@ if not df.empty:
                     res = supabase_client.storage.from_("kaspi").upload(
                         path="kaspi_prices.xml", 
                         file=xml_data, 
-                        file_options={"upsert": "true", "contentType": "application/xml"}
+                        file_options={"upsert": "true", "content-type": "application/xml; charset=utf-8"}
                     )
                     public_url = supabase_client.storage.from_("kaspi").get_public_url("kaspi_prices.xml")
                     st.success("✅ XML файл успешно опубликован!")
@@ -576,6 +731,11 @@ if not df.empty:
                     st.code(public_url)
                 except Exception as e:
                     st.error(f"❌ Ошибка публикации. Подробности: {e}")
+
+    with st.expander("👁️ Предпросмотр сгенерированного XML (первые 50 строк)", expanded=False):
+        xml_text = xml_data.decode('utf-8', errors='replace')
+        first_50_lines = "\n".join(xml_text.splitlines()[:50])
+        st.code(first_50_lines, language="xml")
 
     st.markdown("---")
     
@@ -594,23 +754,49 @@ if not df.empty:
     else:
         display_df = df.copy()
 
-    # Пагинация и сортировка (пустые Артикулы Каспи наверх)
-    mask = display_df['Артикул Каспи'].notna() & \
-           (display_df['Артикул Каспи'].astype(str).str.strip() != '') & \
-           (display_df['Артикул Каспи'].astype(str).str.lower() != 'none') & \
-           (display_df['Артикул Каспи'].astype(str).str.lower() != 'nan')
-           
-    display_df = pd.concat([display_df[~mask], display_df[mask]]).reset_index(drop=True)
+    # Проверяем изменение поиска для обновления стабильного порядка
+    search_changed = (st.session_state.get('last_search_query', None) != search_query)
+    
+    if 'display_order_skus' not in st.session_state or search_changed:
+        st.session_state.last_search_query = search_query
+        # Стабильная сортировка: пустые Артикулы Каспи наверх, внутри сортировка по Артикулу поставщика
+        has_kaspi = display_df['Артикул Каспи'].notna() & \
+                    (display_df['Артикул Каспи'].astype(str).str.strip() != '') & \
+                    (display_df['Артикул Каспи'].astype(str).str.lower() != 'none') & \
+                    (display_df['Артикул Каспи'].astype(str).str.lower() != 'nan')
+        unlinked = display_df[~has_kaspi].sort_values('Артикул поставщика')
+        linked = display_df[has_kaspi].sort_values('Артикул поставщика')
+        ordered = pd.concat([unlinked, linked])
+        st.session_state.display_order_skus = ordered['Артикул поставщика'].tolist()
 
+    # Применяем стабильный порядок к display_df
+    # Строки НЕ перемещаются во время редактирования ячеек!
+    order_map = {sku: idx for idx, sku in enumerate(st.session_state.display_order_skus)}
+    display_df = display_df[display_df['Артикул поставщика'].isin(order_map)].copy()
+    display_df['__order_rank'] = display_df['Артикул поставщика'].map(order_map)
+    display_df = display_df.sort_values('__order_rank').drop(columns=['__order_rank']).reset_index(drop=True)
+
+    col_page, col_refresh = st.columns([3, 1])
     page_size = 50
     total_pages = max(1, len(display_df) // page_size + (1 if len(display_df) % page_size > 0 else 0))
-    page_number = st.number_input("Страница", min_value=1, max_value=total_pages, value=1)
-    
+    with col_page:
+        page_number = st.number_input("Страница", min_value=1, max_value=total_pages, value=1)
+    with col_refresh:
+        st.write("")
+        st.write("")
+        if st.button("🔄 Обновить порядок таблицы"):
+            if 'display_order_skus' in st.session_state:
+                del st.session_state['display_order_skus']
+            st.rerun()
+
     start_idx = (page_number - 1) * page_size
     end_idx = start_idx + page_size
     current_page = display_df.iloc[start_idx:end_idx].copy()
     current_page.reset_index(drop=True, inplace=True)
     
+    # Сохраняем точный снимок Артикулов поставщика для текущей страницы:
+    st.session_state.editor_page_skus = current_page['Артикул поставщика'].tolist()
+
     price_cols = ['Цена закупа', 'Цена на Каспи', 'Минимальная цена', 'Цена реализации']
     for col in price_cols:
         if col in current_page.columns:
@@ -676,10 +862,12 @@ if not df.empty:
             sku_details = {}
             for _, row in valid_rows.iterrows():
                 sku = str(row['Артикул Каспи']).strip()
+                supplier_sku = str(row['Артикул поставщика']).strip()
                 sku_details[sku] = {
+                    'supplier_sku': supplier_sku,
                     'purchase_price': float(row['Цена закупа']) if pd.notna(row['Цена закупа']) else 0.0,
                     'weight': float(row['Вес (кг)']) if pd.notna(row['Вес (кг)']) else 0.0,
-                    'preorder': int(row['Предзаказ']) if pd.notna(row['Предзаказ']) else 1
+                    'preorder': int(row['Предзаказ']) if pd.notna(row['Предзаказ']) else 4
                 }
                 
             progress_bar = st.progress(0)
@@ -708,6 +896,8 @@ if not df.empty:
             
             # Перезагружаем из БД, чтобы обновить UI
             st.session_state.df = load_data_from_db()
+            if 'display_order_skus' in st.session_state:
+                del st.session_state['display_order_skus']
             
             status_text.text("Парсинг завершен!")
             st.success("Цены обновлены.")
